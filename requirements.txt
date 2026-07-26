@@ -1,12 +1,9 @@
 fastapi==0.104.1
 # Hypercorn ASGI server: serves the REST API, the WebSocket transport, and the
-# XHTTP transport on a single port over plain HTTP/1.1. `wsproto` (pulled in
-# automatically) handles WebSocket; `h2` ships as a Hypercorn dependency but
-# XHTTP needs NO end-to-end HTTP/2 — that requirement is exactly what the old
-# gRPC transport tripped over on Railway/Render edges.
+# XHTTP transport on a single port over plain HTTP/1.1. WebSocket support comes
+# from `wsproto`, which Hypercorn pulls in itself — the separate `websockets`
+# package was never imported by anything here and only slowed the build down.
 hypercorn==0.16.0
-h2==4.1.0
 httpx==0.25.1
-websockets==12.0
 psutil==5.9.6
 pydantic-settings==2.1.0
