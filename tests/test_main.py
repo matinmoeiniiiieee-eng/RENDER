@@ -44,7 +44,7 @@ def build_vless_header(uuid_bytes, addr_type=1, address=b"\x01\x01\x01\x01",
 def test_parse_vless_ipv4():
     u = uuid_lib.uuid4()
     buf = build_vless_header(u.bytes, addr_type=1, address=b"\x01\x01\x01\x01", port=443, payload=b"hello")
-    parsed = run(main.parse_vless_header(buf, u.bytes))
+    parsed = main.parse_vless_header(buf, u.bytes)
     assert parsed is not None
     command, address, port, rest = parsed
     assert command == 1
@@ -58,7 +58,7 @@ def test_parse_vless_domain():
     domain = b"example.com"
     addr = bytes([len(domain)]) + domain
     buf = build_vless_header(u.bytes, addr_type=2, address=addr, port=80, payload=b"x")
-    parsed = run(main.parse_vless_header(buf, u.bytes))
+    parsed = main.parse_vless_header(buf, u.bytes)
     assert parsed is not None
     assert parsed[1] == "example.com"
     assert parsed[2] == 80
@@ -68,7 +68,7 @@ def test_parse_vless_ipv6():
     u = uuid_lib.uuid4()
     addr = bytes(range(16))
     buf = build_vless_header(u.bytes, addr_type=3, address=addr, port=443, payload=b"")
-    parsed = run(main.parse_vless_header(buf, u.bytes))
+    parsed = main.parse_vless_header(buf, u.bytes)
     assert parsed is not None
     assert ":" in parsed[1]
 
@@ -78,19 +78,19 @@ def test_parse_vless_uuid_mismatch():
     other = uuid_lib.uuid4()
     buf = build_vless_header(u.bytes)
     with pytest.raises(ValueError):
-        run(main.parse_vless_header(buf, other.bytes))
+        main.parse_vless_header(buf, other.bytes)
 
 
 def test_parse_vless_bad_version():
     u = uuid_lib.uuid4()
     buf = build_vless_header(u.bytes, version=1)
     with pytest.raises(ValueError):
-        run(main.parse_vless_header(buf, u.bytes))
+        main.parse_vless_header(buf, u.bytes)
 
 
 def test_parse_vless_short_buffer_returns_none():
     u = uuid_lib.uuid4()
-    assert run(main.parse_vless_header(b"\x00" * 10, u.bytes)) is None
+    assert main.parse_vless_header(b"\x00" * 10, u.bytes) is None
 
 
 # ----------------------------- Helpers -----------------------------
@@ -439,7 +439,13 @@ def test_xhttp_end_to_end_roundtrip():
             # The echoed payload must come back down the GET stream, then EOF.
             await asyncio.wait_for(get_task, timeout=5)
             disc.set()
-            assert payload in b"".join(down_chunks)
+            down = b"".join(down_chunks)
+            # REGRESSION: the stream must OPEN with the VLESS response header
+            # (version + addon length). Without it the client eats two payload
+            # bytes as the header and every XHTTP config dies at the TLS
+            # handshake. Asserting only `payload in down` missed this entirely.
+            assert down.startswith(main.VLESS_RESPONSE_HEADER)
+            assert down == main.VLESS_RESPONSE_HEADER + payload
             # Session must be cleaned up afterwards.
             assert sid not in main.xhttp_sessions
         finally:
@@ -459,3 +465,309 @@ def test_prune_state_task_helpers_shape():
     expired = [t for t, exp in list(main.SESSIONS.items()) if exp < main.time.time()]
     assert "expired" in expired and "live" not in expired
     main.SESSIONS.clear()
+
+
+# =====================================================================
+# Regression tests for the debugging/hardening pass
+# =====================================================================
+
+# ----------------------------- VLESS protocol -----------------------------
+def test_vless_response_header_constant():
+    """version byte + addon-length byte, exactly two bytes, no more."""
+    assert main.VLESS_RESPONSE_HEADER == b"\x00\x00"
+
+
+def test_unsupported_command_udp_and_mux():
+    assert main.unsupported_reason(main.VLESS_CMD_TCP, "example.com") is None
+    # UDP was silently handed to open_connection() as if it were TCP.
+    assert main.unsupported_reason(main.VLESS_CMD_UDP, "1.1.1.1")
+    # Mux dials the *.mux.cool pseudo-host; fail loudly, not with a DNS error.
+    assert main.unsupported_reason(main.VLESS_CMD_TCP, "v1.mux.cool")
+    assert main.unsupported_reason(9, "example.com")
+
+
+# ----------------------------- input validation -----------------------------
+def test_malformed_json_is_400_not_500(client):
+    client.post("/api/login", json={"password": "admin"})
+    r = client.post("/api/links", content=b"this-is-not-json")
+    assert r.status_code == 400
+
+
+def test_non_numeric_limit_is_400_not_500(client):
+    client.post("/api/login", json={"password": "admin"})
+    r = client.post("/api/links", json={"label": "ok", "limit_value": "abc"})
+    assert r.status_code == 400
+    r = client.post("/api/links", json={"label": "ok", "max_connections": "xx"})
+    assert r.status_code == 400
+
+
+def test_api_404_returns_json_not_camouflage_html(client):
+    """The nginx decoy page must not leak into API responses."""
+    client.post("/api/login", json={"password": "admin"})
+    r = client.patch("/api/links/not-a-real-uuid", json={"active": False})
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+    assert "nginx" not in r.text
+    # Unknown non-API paths still get the decoy.
+    probe = client.get("/wp-admin")
+    assert probe.status_code == 404
+    assert "nginx" in probe.text
+
+
+def test_delete_unknown_link_is_404(client):
+    client.post("/api/login", json={"password": "admin"})
+    assert client.delete("/api/links/00000000-0000-0000-0000-000000000000").status_code == 404
+
+
+# ----------------------------- state integrity -----------------------------
+def test_corrupt_backup_cannot_brick_the_panel(client):
+    """A backup missing required fields used to be stored verbatim, making every
+    later /api/links call raise KeyError -> 500, and it survived restarts."""
+    client.post("/api/login", json={"password": "admin"})
+    good = str(uuid_lib.uuid4())
+    r = client.post("/api/backup", json={
+        "links": {
+            good: {"label": "partial"},          # missing every other field
+            "not-a-uuid": {"label": "bogus"},    # unusable key
+        },
+        "addresses": ["ok.example.com", 123, "   "],
+    })
+    assert r.status_code == 200
+    assert r.json()["imported"] == 1
+    assert r.json()["skipped"] == 1
+    listed = client.get("/api/links")
+    assert listed.status_code == 200
+    entry = next(x for x in listed.json()["links"] if x["uuid"] == good)
+    assert entry["active"] is True and entry["used_bytes"] == 0
+    # Non-string / blank addresses are dropped rather than persisted.
+    assert client.get("/api/addresses").json()["addresses"] == ["ok.example.com"]
+
+
+def test_normalize_link_rejects_bad_uuid_and_coerces_types():
+    assert main.normalize_link("nope", {"label": "x"}) is None
+    assert main.normalize_link(str(uuid_lib.uuid4()), "not-a-dict") is None
+    uid = str(uuid_lib.uuid4())
+    link = main.normalize_link(uid, {"label": "a", "limit_bytes": "2048",
+                                     "max_connections": -5, "active": "yes"})
+    assert link["limit_bytes"] == 2048
+    assert link["max_connections"] == 0
+    assert link["active"] is True
+    assert link["uuid_bytes"] == uuid_lib.UUID(uid).bytes
+
+
+def test_expiry_cache_refreshes_on_update(client):
+    """The memoised expiry timestamp must track edits, or a link stays
+    expired/alive until the process restarts."""
+    client.post("/api/login", json={"password": "admin"})
+    uid = client.post("/api/links", json={"label": "exp", "expiry_days": 1}).json()["uuid"]
+    assert main.is_expired(main.LINKS[uid]) is False
+    client.patch("/api/links/" + uid, json={"expiry_days": -1})
+    assert main.LINKS[uid]["expiry"] == ""
+    assert main.is_expired(main.LINKS[uid]) is False
+    main.LINKS[uid]["expiry"] = "2000-01-01T00:00:00"
+    main._refresh_expiry_cache(main.LINKS[uid])
+    assert main.is_expired(main.LINKS[uid]) is True
+
+
+def test_exported_state_has_no_runtime_only_keys(client):
+    client.post("/api/login", json={"password": "admin"})
+    client.post("/api/links", json={"label": "exp2"})
+    exported = client.get("/api/backup").json()
+    for record in exported["links"].values():
+        assert "uuid_bytes" not in record
+        assert "_expiry_ts" not in record
+
+
+# ----------------------------- helpers -----------------------------
+def test_clean_host_strips_scheme_path_and_slash():
+    assert main._clean_host("https://app.onrender.com/") == "app.onrender.com"
+    assert main._clean_host("http://app.up.railway.app/health") == "app.up.railway.app"
+    assert main._clean_host("plain.example.com") == "plain.example.com"
+
+
+def test_count_connections_does_not_create_defaultdict_entries():
+    uid = str(uuid_lib.uuid4())
+    before = len(main.ip_ref_count)
+    assert main.count_connections_for_link(uid) == 0
+    assert len(main.ip_ref_count) == before
+
+
+def test_hour_key_is_memoised():
+    k1 = main._hour_key()
+    k2 = main._hour_key()
+    assert k1 == k2 == datetime_now_hour()
+
+
+def datetime_now_hour():
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:00")
+
+
+# ----------------------------- auth rotation -----------------------------
+def test_env_password_rotation_is_adopted():
+    """Changing ADMIN_PASSWORD on the host used to be ignored forever, locking
+    the operator out with no recovery path."""
+    saved = main.AUTH
+    saved_cfg = main.CONFIG.admin_password
+    try:
+        main.CONFIG.admin_password = "first-password"
+        main.init_auth()
+        assert main.verify_password("first-password", main.AUTH)
+        # Same env var on restart -> stored hash is kept.
+        assert main.sync_auth_with_env() is False
+        # Rotated env var -> adopted.
+        main.CONFIG.admin_password = "second-password"
+        assert main.sync_auth_with_env() is True
+        assert main.verify_password("second-password", main.AUTH)
+        assert not main.verify_password("first-password", main.AUTH)
+    finally:
+        main.AUTH = saved
+        main.CONFIG.admin_password = saved_cfg
+
+
+def test_panel_password_change_survives_restart():
+    """A password set inside the panel must not be reverted by the unchanged
+    ADMIN_PASSWORD on the next boot."""
+    saved = main.AUTH
+    saved_cfg = main.CONFIG.admin_password
+    try:
+        main.CONFIG.admin_password = "env-password"
+        main.init_auth()
+        main.AUTH = main.make_auth("panel-chosen")
+        main.AUTH["must_change"] = False
+        main.AUTH["env_fp"] = main._env_password_fingerprint("env-password")
+        assert main.sync_auth_with_env() is False
+        assert main.verify_password("panel-chosen", main.AUTH)
+    finally:
+        main.AUTH = saved
+        main.CONFIG.admin_password = saved_cfg
+
+
+# ----------------------------- XHTTP hardening -----------------------------
+def test_xhttp_oversized_body_is_dropped_not_buffered():
+    async def scenario():
+        limit = 1000
+        sent = {"n": 0}
+
+        async def receive():
+            sent["n"] += 1
+            if sent["n"] <= 5:
+                return {"type": "http.request", "body": b"x" * 400, "more_body": True}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        body, too_large = await main._xhttp_read_body(receive, limit)
+        assert too_large is True
+        # The old code kept extending the buffer past the limit.
+        assert body == b""
+
+    asyncio.run(scenario())
+
+
+def test_xhttp_session_table_is_capped():
+    saved = dict(main.xhttp_sessions)
+    try:
+        main.xhttp_sessions.clear()
+        for i in range(main.XHTTP_MAX_SESSIONS):
+            main.xhttp_sessions[f"s{i}"] = object()
+        overflow = main._xhttp_get_or_create("one-too-many", "uid", b"", "1.2.3.4")
+        assert overflow is None
+    finally:
+        main.xhttp_sessions.clear()
+        main.xhttp_sessions.update(saved)
+
+
+def test_xhttp_session_consume_never_goes_negative():
+    s = main.XhttpSession("uid", b"", "1.2.3.4")
+    s.inflight_bytes = 10
+    s.consume(b"x" * 50)
+    assert s.inflight_bytes == 0
+
+
+def test_xhttp_rejects_bad_sequence_numbers():
+    async def scenario():
+        u = uuid_lib.uuid4()
+        uid = str(u)
+        main.LINKS[uid] = main.normalize_link(uid, {"label": "seq"})
+        try:
+            for bad in ("-1", "abc", str(2 ** 40)):
+                status = {}
+
+                async def send(ev):
+                    if ev["type"] == "http.response.start":
+                        status["code"] = ev["status"]
+
+                async def receive():
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                scope = {"type": "http", "method": "POST",
+                         "path": f"/{uid}/badseq-{bad}/{bad}",
+                         "headers": [], "client": ("1.2.3.4", 5)}
+                await main.xhttp_tunnel_asgi(scope, receive, send)
+                assert status.get("code") == 400, bad
+        finally:
+            main.LINKS.pop(uid, None)
+            main.xhttp_sessions.clear()
+
+    asyncio.run(scenario())
+
+
+# ----------------------------- transport isolation -----------------------------
+def test_tunnel_paths_are_excluded_from_gzip():
+    """GZip on the XHTTP downlink buffers interactive packets and wastes CPU on
+    already-encrypted bytes."""
+    assert "/ws/" in main._TUNNEL_PREFIXES
+    assert f"/{main.XHTTP_PATH_PREFIX}/" in main._TUNNEL_PREFIXES
+    assert "/xhttp/abc/def".startswith(main._TUNNEL_PREFIXES)
+    assert not "/api/links".startswith(main._TUNNEL_PREFIXES)
+
+
+def test_panel_sends_security_headers(client):
+    r = client.get("/login")
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    assert r.headers.get("X-Frame-Options") == "DENY"
+
+
+def test_xhttp_downlink_headers_are_not_buffered_by_middleware():
+    """The middleware stack must not defer `http.response.start`.
+
+    Starlette's BaseHTTPMiddleware pumps responses through a buffered stream, so
+    the long-lived downlink GET never flushed its headers and the client hung.
+    This drives the FULL app (middleware included), not the bare tunnel handler.
+    """
+    async def scenario():
+        u = uuid_lib.uuid4()
+        uid = str(u)
+        main.LINKS[uid] = main.normalize_link(uid, {"label": "stream"})
+        try:
+            started = asyncio.Event()
+            disc = asyncio.Event()
+
+            async def receive():
+                await disc.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(ev):
+                if ev["type"] == "http.response.start":
+                    assert not any(k.lower() == b"content-encoding"
+                                   for k, _ in ev["headers"]), "tunnel must not be gzipped"
+                    started.set()
+
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "GET",
+                "path": f"/{main.XHTTP_PATH_PREFIX}/{uid}/stream-session",
+                "raw_path": f"/{main.XHTTP_PATH_PREFIX}/{uid}/stream-session".encode(),
+                "root_path": "", "scheme": "http", "query_string": b"",
+                "headers": [(b"host", b"test"), (b"accept-encoding", b"gzip")],
+                "client": ("1.2.3.4", 5), "server": ("test", 80),
+            }
+            task = asyncio.create_task(main.app(scope, receive, send))
+            # Headers must land immediately, long before any uplink data exists.
+            await asyncio.wait_for(started.wait(), timeout=2)
+            disc.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            main.LINKS.pop(uid, None)
+            main.xhttp_sessions.clear()
+
+    asyncio.run(scenario())
