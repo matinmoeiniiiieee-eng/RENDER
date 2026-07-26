@@ -142,6 +142,16 @@ XHTTP_MAX_INFLIGHT_BYTES = 4_000_000
 # Seconds to wait for the downlink GET to correlate with a freshly seen session
 # before reaping it (mirrors Xray-core's 30 s correlation window).
 XHTTP_SESSION_GRACE = 30
+# Hard cap on concurrently tracked XHTTP sessions. Every unknown sessionId in a
+# request would otherwise allocate a session + reaper task, so an unauthenticated
+# scanner could exhaust memory on the free tier before the grace window expires.
+XHTTP_MAX_SESSIONS = 512
+
+# VLESS server response header: version byte (0) + addon length (0). The server
+# MUST emit these two bytes once, before the first downstream payload byte, on
+# EVERY transport. Omitting it makes the client consume two payload bytes as the
+# header and silently corrupts the whole stream (this was broken on XHTTP).
+VLESS_RESPONSE_HEADER = b"\x00\x00"
 
 # ==========================================
 # Password Hashing & Authentication
@@ -162,12 +172,42 @@ def verify_password(pw: str, auth: dict) -> bool:
     candidate = hash_password(pw, salt)
     return secrets.compare_digest(candidate, auth.get("hash", ""))
 
+def _env_password_fingerprint(pw: str) -> str:
+    """Stable, non-reversible marker for 'which ADMIN_PASSWORD produced this auth'.
+
+    Stored alongside the hash so a restart can tell an unchanged env var from a
+    rotated one without keeping the plaintext around.
+    """
+    return hashlib.sha256(("ren-env-fp:" + pw).encode("utf-8")).hexdigest()
+
 def init_auth():
     global AUTH
     env_pw = CONFIG.admin_password or "admin"
     AUTH = make_auth(env_pw)
+    AUTH["env_fp"] = _env_password_fingerprint(env_pw)
     # Force a change while the operator is still on the well-known default.
     AUTH["must_change"] = (env_pw == "admin")
+
+def sync_auth_with_env():
+    """Adopt a rotated ADMIN_PASSWORD, but never undo a panel-side change.
+
+    Previously the persisted hash always won, so an operator who changed
+    ADMIN_PASSWORD on Render/Railway after the first boot was locked out with no
+    way back short of deleting the state file. We now compare a fingerprint of
+    the current env password with the one that produced the stored hash: if they
+    differ the env var was rotated and wins; if they match, the stored hash (which
+    may have been changed from inside the panel) is kept.
+    """
+    global AUTH
+    env_pw = CONFIG.admin_password or "admin"
+    fp = _env_password_fingerprint(env_pw)
+    if AUTH.get("env_fp") == fp:
+        return False
+    AUTH = make_auth(env_pw)
+    AUTH["env_fp"] = fp
+    AUTH["must_change"] = (env_pw == "admin")
+    logger.info("ADMIN_PASSWORD changed in the environment - panel password updated.")
+    return True
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
@@ -214,6 +254,57 @@ def reset_login_attempts(ip: str):
 # Persistence (JSON file, stdlib only)
 # ==========================================
 _persist_lock = asyncio.Lock()
+# Set whenever in-memory state diverges from disk; the periodic flusher only
+# writes when it is set, so an idle instance stops doing pointless I/O (which on
+# a free-tier container also means pointless CPU credits and disk wear).
+_state_dirty = False
+
+def mark_dirty():
+    global _state_dirty
+    _state_dirty = True
+
+# Canonical shape of a link record. Anything loaded from disk or imported from a
+# user-supplied backup is coerced into this shape; previously a backup missing a
+# single key (e.g. "active") was accepted and then made every /api/links call
+# raise KeyError -> HTTP 500, permanently bricking the panel because the broken
+# record was persisted straight back to disk.
+_LINK_DEFAULTS = {
+    "label": "Link",
+    "limit_bytes": 0,
+    "used_bytes": 0,
+    "max_connections": 0,
+    "created_at": "",
+    "active": True,
+    "expiry": "",
+}
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def normalize_link(uid: str, raw) -> dict | None:
+    """Validate + normalize one link record. Returns None if it is unusable."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        uuid_bytes = uuid_lib.UUID(uid).bytes
+    except (ValueError, AttributeError, TypeError):
+        return None
+    link = dict(_LINK_DEFAULTS)
+    link.update({k: v for k, v in raw.items() if k in _LINK_DEFAULTS})
+    label = str(link["label"] or "Link")[:60]
+    link["label"] = label or "Link"
+    link["limit_bytes"] = max(0, _coerce_int(link["limit_bytes"]))
+    link["used_bytes"] = max(0, _coerce_int(link["used_bytes"]))
+    link["max_connections"] = max(0, _coerce_int(link["max_connections"]))
+    link["active"] = bool(link["active"])
+    link["expiry"] = str(link["expiry"] or "")
+    link["created_at"] = str(link["created_at"] or datetime.now().isoformat())
+    link["uuid_bytes"] = uuid_bytes
+    _refresh_expiry_cache(link)
+    return link
 
 def _data_path() -> str:
     # A persistent volume (DATA_DIR) always wins: the state file lives inside it
@@ -226,14 +317,18 @@ def _data_path() -> str:
     p = CONFIG.data_file
     return p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
 
+# Runtime-only keys that must never reach the JSON file (bytes are not
+# serialisable, and the expiry cache is derived state).
+_VOLATILE_LINK_KEYS = ("uuid_bytes", "_expiry_ts")
+
+def export_link(link: dict) -> dict:
+    return {k: v for k, v in link.items() if k not in _VOLATILE_LINK_KEYS}
+
 def save_state_sync():
     path = _data_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    export_links = {}
-    for k, v in LINKS.items():
-        export_links[k] = {kk: vv for kk, vv in v.items() if kk != "uuid_bytes"}
     data = {
-        "links": export_links,
+        "links": {k: export_link(v) for k, v in LINKS.items()},
         "addresses": CUSTOM_ADDRESSES,
         "domain": CUSTOM_DOMAIN,
         "auth": AUTH,
@@ -242,13 +337,21 @@ def save_state_sync():
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
+    # The file holds the admin password hash + salt: keep it owner-only.
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     os.replace(tmp, path)
 
 async def save_state():
+    global _state_dirty
     async with _persist_lock:
+        _state_dirty = False
         try:
             await asyncio.to_thread(save_state_sync)
         except Exception as exc:
+            _state_dirty = True
             logger.error(f"Failed to persist state: {exc}")
 
 def load_state() -> bool:
@@ -264,14 +367,14 @@ def load_state() -> bool:
         return False
 
     for k, v in (data.get("links") or {}).items():
-        try:
-            v["uuid_bytes"] = uuid_lib.UUID(k).bytes
-            LINKS[k] = v
-        except Exception:
+        link = normalize_link(k, v)
+        if link is None:
             logger.warning(f"Skipping invalid link during load: {k}")
+            continue
+        LINKS[k] = link
     addresses = data.get("addresses")
     if isinstance(addresses, list):
-        CUSTOM_ADDRESSES = addresses
+        CUSTOM_ADDRESSES = [str(a) for a in addresses if isinstance(a, str) and a.strip()]
     if isinstance(data.get("domain"), str):
         CUSTOM_DOMAIN = data["domain"]
     if isinstance(data.get("auth"), dict) and data["auth"].get("hash"):
@@ -288,9 +391,10 @@ async def keep_alive():
         await asyncio.sleep(600)
         try:
             domain = get_domain()
-            if domain and domain != "localhost":
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.get(f"https://{domain}/health")
+            # Reuse the shared pooled client instead of building (and tearing
+            # down) a fresh TLS stack every 10 minutes.
+            if domain and domain != "localhost" and http_client is not None:
+                await http_client.get(f"https://{domain}/health", timeout=10.0)
         except Exception:
             pass
 
@@ -311,10 +415,12 @@ async def cleanup_traffic_task():
 
 async def periodic_save_task():
     # Traffic/usage counters change in the hot path; flush them periodically
-    # instead of on every packet to avoid I/O storms.
+    # instead of on every packet to avoid I/O storms. The dirty flag means an
+    # idle instance writes nothing at all.
     while True:
         await asyncio.sleep(60)
-        await save_state()
+        if _state_dirty:
+            await save_state()
 
 async def prune_state_task():
     # Sessions and login-attempt buckets are only cleaned lazily on access, so
@@ -332,22 +438,40 @@ async def prune_state_task():
                 login_attempts[ip] = recent
             else:
                 login_attempts.pop(ip, None)
+        # Safety net for XHTTP sessions whose reaper task was lost (e.g. the
+        # event loop cancelled it): anything long past its grace window with no
+        # downlink attached is dead weight.
+        mono = time.monotonic()
+        for sid, sess in list(xhttp_sessions.items()):
+            if (not sess.get_attached.is_set()
+                    and mono - sess.created > XHTTP_SESSION_GRACE * 2):
+                sess.closed.set()
+                xhttp_sessions.pop(sid, None)
 
 def ensure_default_link():
     if not LINKS:
         uid = str(uuid_lib.uuid4())
-        LINKS[uid] = {
-            "label": "Default", "limit_bytes": 0, "used_bytes": 0,
-            "max_connections": 0, "created_at": datetime.now().isoformat(),
-            "active": True, "expiry": "",
-            "uuid_bytes": uuid_lib.UUID(uid).bytes
-        }
+        LINKS[uid] = normalize_link(uid, {"label": "Default"})
+        mark_dirty()
 
 # ==========================================
 # Helpers
 # ==========================================
+def _clean_host(raw: str) -> str:
+    """Strip scheme, path and trailing slash from a PaaS-provided URL.
+
+    RENDER_EXTERNAL_URL is a full URL (https://x.onrender.com), and a trailing
+    slash used to survive into every generated vless:// link and SNI value,
+    producing configs that silently failed to connect.
+    """
+    host = (raw or "").strip()
+    host = host.split("://", 1)[-1]
+    host = host.split("/", 1)[0]
+    return host.strip().rstrip(".")
+
 def get_domain() -> str:
-    return os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")).replace("https://", "").replace("http://", "")
+    raw = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "localhost"
+    return _clean_host(raw) or "localhost"
 
 def generate_vless_link(uuid: str, remark: str = "REN", address: str = None,
                         transport: str = "ws") -> str:
@@ -424,23 +548,37 @@ def compute_expiry(expiry_days) -> str:
         return ""
     return (datetime.now() + timedelta(days=days)).isoformat()
 
+def _refresh_expiry_cache(link: dict) -> float:
+    """Parse `expiry` once and memoise it as a POSIX timestamp on the record.
+
+    is_expired() runs on EVERY proxied chunk via check_quota(); parsing an ISO-8601
+    string there burned a surprising amount of CPU per megabyte on the free tier.
+    0.0 means "never expires".
+    """
+    exp = link.get("expiry")
+    ts = 0.0
+    if exp:
+        try:
+            ts = datetime.fromisoformat(exp).timestamp()
+        except (TypeError, ValueError):
+            ts = 0.0
+    link["_expiry_ts"] = ts
+    return ts
+
+def _expiry_ts(link) -> float:
+    if not isinstance(link, dict):
+        return 0.0
+    ts = link.get("_expiry_ts")
+    if ts is None:
+        ts = _refresh_expiry_cache(link)
+    return ts
+
 def is_expired(link) -> bool:
-    exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp:
-        return False
-    try:
-        return datetime.now() >= datetime.fromisoformat(exp)
-    except (TypeError, ValueError):
-        return False
+    ts = _expiry_ts(link)
+    return bool(ts) and time.time() >= ts
 
 def expiry_epoch(link) -> int:
-    exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp:
-        return 0
-    try:
-        return int(datetime.fromisoformat(exp).timestamp())
-    except (TypeError, ValueError):
-        return 0
+    return int(_expiry_ts(link))
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -451,7 +589,10 @@ def get_client_ip(websocket: WebSocket) -> str:
     return "unknown"
 
 def count_connections_for_link(uid: str) -> int:
-    return sum(ip_ref_count[uid].values())
+    # .get() rather than [] — ip_ref_count is a defaultdict, so the old indexing
+    # created (and never removed) an empty bucket for every link on every
+    # /api/links call, leaking memory in proportion to panel refreshes.
+    return sum(ip_ref_count.get(uid, {}).values())
 
 def remove_ip_from_link(uid: str, ip: str):
     if uid in ip_ref_count and ip in ip_ref_count[uid]:
@@ -513,6 +654,8 @@ async def lifespan(app: FastAPI):
     load_state()
     if "hash" not in AUTH:
         init_auth()
+    else:
+        sync_auth_with_env()
     if AUTH.get("must_change"):
         logger.warning("SECURITY: admin password is the default 'admin'. "
                        "Set a strong ADMIN_PASSWORD or change it in the panel immediately.")
@@ -557,9 +700,96 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Paths that carry the raw proxy byte-stream and must NEVER be touched by
+# content encoding.
+_TUNNEL_PREFIXES = ("/ws/", f"/{XHTTP_PATH_PREFIX}/", f"/{XHTTP_PATH_PREFIX}")
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    """GZip for the dashboard/API only.
+
+    Starlette's GZipMiddleware compresses ANY streaming HTTP response whose client
+    advertises `Accept-Encoding: gzip` — including the long XHTTP downlink GET.
+    That was actively harmful: the tunnel payload is already TLS-encrypted (so
+    compression buys nothing but CPU), and gzip's internal buffering delays small
+    interactive packets until enough bytes accumulate, which shows up as a laggy
+    or stalled connection. Tunnel paths are now passed through untouched.
+    """
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path.startswith(_TUNNEL_PREFIXES):
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000)
+
+class SecurityHeadersMiddleware:
+    """Add hardening headers to panel/API responses only.
+
+    Deliberately pure ASGI rather than @app.middleware("http"): Starlette's
+    BaseHTTPMiddleware pumps the response through an anyio stream, which defers
+    `http.response.start` and buffers body chunks. On the long-lived XHTTP
+    downlink that means the client never sees the response headers and the
+    tunnel hangs — verified at socket level (time-to-first-header went from
+    0.002 s to a hard timeout) before this was rewritten.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "").startswith(_TUNNEL_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                present = {k.lower() for k, _ in headers}
+                for key, value in ((b"x-content-type-options", b"nosniff"),
+                                   (b"referrer-policy", b"no-referrer"),
+                                   (b"x-frame-options", b"DENY")):
+                    if key not in present:
+                        headers.append((key, value))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 api_router = APIRouter(prefix="/api")
+
+# ==========================================
+# Request-body helpers (malformed input -> 400, never 500)
+# ==========================================
+async def read_json(request: Request) -> dict:
+    """Parse a JSON object body, answering 400 instead of crashing on garbage."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    return body
+
+def body_float(body: dict, key: str, default: float = 0.0) -> float:
+    value = body.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"'{key}' must be a number")
+
+def body_int(body: dict, key: str, default: int = 0, minimum: int = 0) -> int:
+    value = body.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return max(minimum, int(float(value)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"'{key}' must be a whole number")
 
 def _cookie_is_secure() -> bool:
     return get_domain() != "localhost"
@@ -579,8 +809,16 @@ FAKE_HTML = """
 async def root():
     return HTMLResponse(content=FAKE_HTML, status_code=200)
 
+_JSON_ERROR_PREFIXES = ("/api/", "/stats")
+
 @app.exception_handler(404)
 async def custom_404_handler(request: Request, exc):
+    # The camouflage page is for probes hitting unknown paths. It used to swallow
+    # legitimate API 404s too, so the dashboard received `text/html` where it
+    # awaited JSON and every "not found" surfaced as a generic failure.
+    if request.url.path.startswith(_JSON_ERROR_PREFIXES):
+        detail = getattr(exc, "detail", "not found")
+        return JSONResponse({"detail": detail}, status_code=404)
     return HTMLResponse(content=FAKE_HTML, status_code=404)
 
 @app.get("/health")
@@ -595,7 +833,7 @@ async def api_login(request: Request):
     ip = request_ip(request)
     if is_rate_limited(ip):
         raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
-    body = await request.json()
+    body = await read_json(request)
     password = str(body.get("password") or "")
     if not verify_password(password, AUTH):
         record_failed_login(ip)
@@ -627,7 +865,7 @@ async def api_me(request: Request):
 @api_router.post("/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
     global AUTH
-    body = await request.json()
+    body = await read_json(request)
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
     if not verify_password(current, AUTH):
@@ -636,6 +874,10 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     AUTH = make_auth(new)
     AUTH["must_change"] = False
+    # Preserve the fingerprint of the CURRENT env password. Without it the next
+    # restart would see "env differs from stored" and silently roll this change
+    # back to whatever ADMIN_PASSWORD still says.
+    AUTH["env_fp"] = _env_password_fingerprint(CONFIG.admin_password or "admin")
     current_token = request.cookies.get(SESSION_COOKIE)
     SESSIONS.clear()
     if current_token:
@@ -662,24 +904,22 @@ async def get_stats(_=Depends(require_auth)):
 
 @api_router.post("/links")
 async def create_link(request: Request, _=Depends(require_auth)):
-    body = await request.json()
+    body = await read_json(request)
     label = (body.get("label") or "New Link").strip()[:60]
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label) or not label:
         raise HTTPException(status_code=400, detail="Invalid inbound name")
 
-    limit_value = float(body.get("limit_value") or 0)
+    limit_value = body_float(body, "limit_value")
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-    max_conn = max(0, int(body.get("max_connections") or 0))
-    expiry = compute_expiry(body.get("expiry_days"))
+    max_conn = body_int(body, "max_connections")
+    expiry = compute_expiry(body_float(body, "expiry_days"))
     uid = str(uuid_lib.uuid4())
 
-    uid_bytes = uuid_lib.UUID(uid).bytes
-    LINKS[uid] = {
-        "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-        "max_connections": max_conn, "created_at": datetime.now().isoformat(),
-        "active": True, "expiry": expiry, "uuid_bytes": uid_bytes
-    }
+    LINKS[uid] = normalize_link(uid, {
+        "label": label, "limit_bytes": limit_bytes, "max_connections": max_conn,
+        "created_at": datetime.now().isoformat(), "active": True, "expiry": expiry,
+    })
     await save_state()
     return {
         "uuid": uid,
@@ -707,29 +947,37 @@ async def list_links(_=Depends(require_auth)):
 
 @api_router.patch("/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
+    body = await read_json(request)
     if uid not in LINKS:
         raise HTTPException(status_code=404, detail="link not found")
+    link = LINKS[uid]
     if "active" in body:
-        LINKS[uid]["active"] = bool(body["active"])
+        link["active"] = bool(body["active"])
     if "limit_value" in body:
-        limit_value = float(body.get("limit_value") or 0)
+        limit_value = body_float(body, "limit_value")
         limit_unit = body.get("limit_unit") or "GB"
-        LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-    if "reset_usage" in body and body["reset_usage"]:
-        LINKS[uid]["used_bytes"] = 0
+        link["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    if body.get("reset_usage"):
+        link["used_bytes"] = 0
     if "expiry_days" in body:
-        LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
+        link["expiry"] = compute_expiry(body_float(body, "expiry_days"))
+        # Keep the memoised timestamp in step, otherwise a link stays "expired"
+        # (or stays alive) until the next restart.
+        _refresh_expiry_cache(link)
     if "label" in body:
-        LINKS[uid]["label"] = str(body["label"])[:60]
+        label = str(body["label"]).strip()[:60]
+        if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+            raise HTTPException(status_code=400, detail="Invalid inbound name")
+        link["label"] = label
     if "max_connections" in body:
-        LINKS[uid]["max_connections"] = max(0, int(body["max_connections"] or 0))
+        link["max_connections"] = body_int(body, "max_connections")
     await save_state()
     return {"ok": True}
 
 @api_router.delete("/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    LINKS.pop(uid, None)
+    if LINKS.pop(uid, None) is None:
+        raise HTTPException(status_code=404, detail="link not found")
     await close_connections_for_link(uid)
     await save_state()
     return {"ok": True}
@@ -740,10 +988,9 @@ async def get_custom_domain(_=Depends(require_auth)):
 
 @api_router.post("/domain")
 async def set_custom_domain(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    domain = (body.get("domain") or "").strip().lower()
+    body = await read_json(request)
+    domain = _clean_host(str(body.get("domain") or "")).lower()
     if domain:
-        domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
         if not re.match(r'^[a-z0-9\-_.]+$', domain):
             raise HTTPException(status_code=400, detail="Invalid domain format")
     global CUSTOM_DOMAIN
@@ -757,7 +1004,7 @@ async def list_addresses(_=Depends(require_auth)):
 
 @api_router.post("/addresses")
 async def add_address(request: Request, _=Depends(require_auth)):
-    body = await request.json()
+    body = await read_json(request)
     address = (body.get("address") or "").strip()
     if not address or not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
         raise HTTPException(status_code=400, detail="Invalid address")
@@ -777,34 +1024,37 @@ async def delete_address(index: int, _=Depends(require_auth)):
 
 @api_router.get("/backup")
 async def export_data(_=Depends(require_auth)):
-    export_links = {}
-    for k, v in LINKS.items():
-        clean_v = v.copy()
-        clean_v.pop("uuid_bytes", None)  # Exclude pre-compiled bytes
-        export_links[k] = clean_v
     return {
-        "links": export_links,
-        "addresses": CUSTOM_ADDRESSES,
+        "links": {k: export_link(v) for k, v in LINKS.items()},
+        "addresses": list(CUSTOM_ADDRESSES),
         "domain": CUSTOM_DOMAIN,
     }
 
 @api_router.post("/backup")
 async def import_data(request: Request, _=Depends(require_auth)):
-    data = await request.json()
-    global LINKS, CUSTOM_ADDRESSES, CUSTOM_DOMAIN
-    if "links" in data and isinstance(data["links"], dict):
+    data = await read_json(request)
+    global CUSTOM_ADDRESSES, CUSTOM_DOMAIN
+    imported = skipped = 0
+    # Every record goes through the same normalizer as the on-disk loader. A
+    # hand-edited or truncated backup used to be written straight into LINKS and
+    # then persisted, so one missing field turned every later /api/links call
+    # into a 500 that survived restarts.
+    if isinstance(data.get("links"), dict):
         for k, v in data["links"].items():
-            try:
-                v["uuid_bytes"] = uuid_lib.UUID(k).bytes
-                LINKS[k] = v
-            except Exception:
+            link = normalize_link(k, v)
+            if link is None:
+                skipped += 1
                 logger.warning(f"Skipping invalid link during import: {k}")
-    if "addresses" in data and isinstance(data["addresses"], list):
-        CUSTOM_ADDRESSES = data["addresses"]
-    if "domain" in data and isinstance(data["domain"], str):
-        CUSTOM_DOMAIN = data["domain"]
+                continue
+            LINKS[k] = link
+            imported += 1
+    if isinstance(data.get("addresses"), list):
+        CUSTOM_ADDRESSES = [a.strip() for a in data["addresses"]
+                            if isinstance(a, str) and a.strip()]
+    if isinstance(data.get("domain"), str):
+        CUSTOM_DOMAIN = _clean_host(data["domain"]).lower()
     await save_state()
-    return {"ok": True}
+    return {"ok": True, "imported": imported, "skipped": skipped}
 
 app.include_router(api_router)
 
@@ -864,7 +1114,12 @@ def decode_early_data(subprotocol_header: str | None) -> bytes:
         return b""
 
 
-async def parse_vless_header(buffer: bytes, expected_uuid_bytes: bytes):
+def parse_vless_header(buffer: bytes, expected_uuid_bytes: bytes):
+    """Parse a VLESS request header. Returns None while more bytes are needed.
+
+    Synchronous on purpose: it never awaits, so making it a coroutine only added
+    an event-loop round-trip per connection setup.
+    """
     if len(buffer) < 24:
         return None
 
@@ -912,17 +1167,36 @@ async def parse_vless_header(buffer: bytes, expected_uuid_bytes: bytes):
 
     return command, address, port, buffer[pos:]
 
+# VLESS commands: 1 = TCP, 2 = UDP, 3 = MUX.
+VLESS_CMD_TCP = 1
+VLESS_CMD_UDP = 2
+MUX_ADDRESS_SUFFIX = "mux.cool"
+
+def unsupported_reason(command: int, address: str) -> str | None:
+    """Return a human-readable reason if this request cannot be served, else None.
+
+    Both tunnels only bridge TCP. Previously a UDP request (command 2) was fed to
+    asyncio.open_connection() anyway, so it half-worked in confusing ways, and a
+    mux-enabled client (which dials the pseudo-host *.mux.cool) failed with an
+    opaque DNS error. Naming the cause makes the panel's error log actionable.
+    """
+    if command == VLESS_CMD_UDP:
+        return ("UDP over VLESS is not supported by this gateway; "
+                "set the app's DNS/routing to TCP")
+    if command != VLESS_CMD_TCP:
+        return f"unsupported VLESS command: {command}"
+    if address and address.lower().endswith(MUX_ADDRESS_SUFFIX):
+        return "multiplexing (mux) is not supported; disable mux in the client"
+    return None
+
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     link = LINKS.get(uid)
-    if not link or not link["active"] or is_expired(link):
+    if not link or not link.get("active") or is_expired(link):
         return False
-    if link["limit_bytes"] == 0:
+    limit = link.get("limit_bytes", 0)
+    if limit == 0:
         return True
-    return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
-
-async def add_usage(uid: str, n: int):
-    if uid in LINKS:
-        LINKS[uid]["used_bytes"] += n
+    return (link.get("used_bytes", 0) + extra_bytes) <= limit
 
 # --- Shared transport helpers (reused by both the WS and XHTTP tunnels) ------
 def _apply_socket_opts(writer: asyncio.StreamWriter):
@@ -955,20 +1229,42 @@ async def open_upstream(address: str, port: int):
     _apply_socket_opts(writer)
     return reader, writer
 
+_hour_bucket = {"until": 0.0, "key": ""}
+
+def _hour_key() -> str:
+    """Current "%Y-%m-%d %H:00" bucket, recomputed at most once per hour.
+
+    account_traffic() runs for every proxied chunk, and datetime.now().strftime()
+    there meant a full datetime construction + string format per packet.
+    """
+    now = time.time()
+    if now >= _hour_bucket["until"]:
+        dt = datetime.now()
+        _hour_bucket["key"] = dt.strftime("%Y-%m-%d %H:00")
+        # Expire at the top of the next hour.
+        _hour_bucket["until"] = now + (3600 - (dt.minute * 60 + dt.second))
+    return _hour_bucket["key"]
+
 def account_traffic(conn_id: str | None, uid: str, size: int, is_request: bool = False):
     """Record byte accounting for a transferred chunk (transport-agnostic).
 
     Consolidates the global stats counters, per-connection byte tally, hourly
     traffic histogram and per-link usage that the WS and XHTTP pumps both need.
     """
+    global _state_dirty
     stats["total_bytes"] += size
     if is_request:
         stats["total_requests"] += 1
-    if conn_id and conn_id in connections:
-        connections[conn_id]["bytes"] += size
-    hourly_traffic[datetime.now().strftime("%Y-%m-%d %H:00")] += size
-    if uid in LINKS:
-        LINKS[uid]["used_bytes"] += size
+    if conn_id:
+        conn = connections.get(conn_id)
+        if conn is not None:
+            conn["bytes"] += size
+    hourly_traffic[_hour_key()] += size
+    link = LINKS.get(uid)
+    if link is not None:
+        link["used_bytes"] += size
+        # Usage moved -> the periodic flusher has something worth writing.
+        _state_dirty = True
 
 async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
     try:
@@ -1022,7 +1318,7 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
 
             account_traffic(conn_id, link_uid, size)
 
-            await websocket.send_bytes((b"\x00\x00" + data) if first else data)
+            await websocket.send_bytes((VLESS_RESPONSE_HEADER + data) if first else data)
             first = False
     except (asyncio.TimeoutError, WebSocketDisconnect):
         pass
@@ -1065,7 +1361,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         command = port = address = initial_payload = None
         while True:
             if buffer:
-                parsed = await parse_vless_header(buffer, expected_bytes)
+                parsed = parse_vless_header(buffer, expected_bytes)
                 if parsed is not None:
                     command, address, port, initial_payload = parsed
                     break
@@ -1082,6 +1378,13 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             if not chunk:
                 continue
             buffer += chunk
+
+        # Only TCP is bridged; say so plainly instead of half-proxying.
+        reason = unsupported_reason(command, address)
+        if reason:
+            error_logs.append({"error": f"ws: {reason}", "time": datetime.now().isoformat()})
+            await websocket.close(code=1008, reason="unsupported request")
+            return
 
         # SSRF hardening: refuse internal / metadata destinations.
         if not await destination_allowed(address, port):
@@ -1205,6 +1508,10 @@ class XhttpSession:
         except Exception:
             pass
 
+    def consume(self, chunk: bytes):
+        """Account for uplink bytes leaving the queue, never going negative."""
+        self.inflight_bytes = max(0, self.inflight_bytes - len(chunk))
+
 
 def _xhttp_client_ip(scope) -> str:
     for name, value in scope.get("headers", []):
@@ -1239,8 +1546,10 @@ async def _xhttp_send_simple(send, status: int, extra_headers=None):
 async def _xhttp_read_body(receive, limit: int):
     """Collect a bounded request body from ASGI receive events.
 
-    Returns (body_bytes, too_large). Keeps reading to end-of-body so the request
-    is fully consumed, but flags anything over `limit`.
+    Returns (body_bytes, too_large). Once the limit is passed we stop retaining
+    bytes and just drain the request: the previous version kept extending the
+    buffer after setting the flag, so a client streaming an endless body could
+    exhaust memory even though the response was going to be a 413 anyway.
     """
     body = bytearray()
     too_large = False
@@ -1249,10 +1558,11 @@ async def _xhttp_read_body(receive, limit: int):
         et = event["type"]
         if et == "http.request":
             chunk = event.get("body") or b""
-            if chunk:
+            if chunk and not too_large:
                 body.extend(chunk)
                 if len(body) > limit:
                     too_large = True
+                    body = bytearray()   # release what we already read
             if not event.get("more_body", False):
                 break
         elif et == "http.disconnect":
@@ -1282,10 +1592,17 @@ async def _xhttp_feed_packet(session: "XhttpSession", seq: int, body: bytes) -> 
 
 
 def _xhttp_get_or_create(session_id: str, link_uuid: str, expected_bytes: bytes,
-                         client_ip: str) -> "XhttpSession":
+                         client_ip: str) -> "XhttpSession | None":
     session = xhttp_sessions.get(session_id)
     if session is not None:
         return session
+    # Bound the table: every unseen sessionId in a request would otherwise
+    # allocate a session object plus a reaper task, so a scanner spraying random
+    # ids could push a free-tier container out of memory inside the grace window.
+    if len(xhttp_sessions) >= XHTTP_MAX_SESSIONS:
+        logger.warning("XHTTP session table full (%d); rejecting new session",
+                       XHTTP_MAX_SESSIONS)
+        return None
     session = XhttpSession(link_uuid, expected_bytes, client_ip)
     xhttp_sessions[session_id] = session
     asyncio.create_task(_xhttp_reaper(session_id, session))
@@ -1317,6 +1634,15 @@ async def _xhttp_uplink_stream(receive, send, session: "XhttpSession"):
                         break
                     session.up_queue.put_nowait(chunk)
                     session.inflight_bytes += len(chunk)
+                    # Same backpressure the packet-up path applies: without it a
+                    # fast client streaming into a slow destination grows the
+                    # queue without bound.
+                    waited = 0.0
+                    while (session.inflight_bytes > XHTTP_MAX_INFLIGHT_BYTES
+                           and not session.closed.is_set()
+                           and waited < XHTTP_SESSION_GRACE):
+                        await asyncio.sleep(0.05)
+                        waited += 0.05
                 if not event.get("more_body", False):
                     break
             elif et == "http.disconnect":
@@ -1335,6 +1661,11 @@ async def _xhttp_uplink(scope, receive, send, session, session_id, seq_str):
     try:
         seq = int(seq_str)
     except ValueError:
+        await _xhttp_send_simple(send, 400, [_xhttp_padding_header()])
+        return
+    # A negative or absurd seq can only be junk; accepting it would let a single
+    # request wedge the reorder window forever.
+    if seq < 0 or seq > 2 ** 31:
         await _xhttp_send_simple(send, 400, [_xhttp_padding_header()])
         return
 
@@ -1411,7 +1742,7 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
         header_ready = False
         while not header_ready:
             if buffer:
-                parsed = await parse_vless_header(buffer, session.expected_bytes)
+                parsed = parse_vless_header(buffer, session.expected_bytes)
                 if parsed is not None:
                     command, address, port, initial_payload = parsed
                     header_ready = True
@@ -1425,8 +1756,12 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
                 raise ValueError("uplink header timeout")
             if chunk is None:
                 raise ValueError("uplink closed before header")
-            session.inflight_bytes -= len(chunk)
+            session.consume(chunk)
             buffer += chunk
+
+        reason = unsupported_reason(command, address)
+        if reason:
+            raise ValueError(reason)
 
         # SSRF hardening: refuse internal / metadata destinations.
         if not await destination_allowed(address, port):
@@ -1463,7 +1798,7 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
                     chunk = await session.up_queue.get()
                     if chunk is None:
                         break
-                    session.inflight_bytes -= len(chunk)
+                    session.consume(chunk)
                     size = len(chunk)
                     if not await check_quota(uid, size):
                         break
@@ -1480,6 +1815,11 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
 
         async def downlink_pump():
             # Upstream socket -> the GET response body (raw bytes, no framing).
+            # The VLESS response header MUST lead the stream. This was missing:
+            # the client then read the first two payload bytes as version/addon
+            # length and every XHTTP connection failed at the TLS handshake. WS
+            # already did this in tcp_to_ws(); both transports now agree.
+            first = True
             buf_size = DOWNSTREAM_MIN_BUF
             try:
                 while True:
@@ -1494,10 +1834,22 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
                     if not await check_quota(uid, size):
                         break
                     account_traffic(conn_id, uid, size)
+                    if first:
+                        data = VLESS_RESPONSE_HEADER + data
+                        first = False
                     await send({"type": "http.response.body",
                                 "body": data, "more_body": True})
             except Exception:
                 pass
+            finally:
+                # An upstream that closes without sending anything still owes the
+                # client a well-formed (empty) VLESS response.
+                if first:
+                    try:
+                        await send({"type": "http.response.body",
+                                    "body": VLESS_RESPONSE_HEADER, "more_body": True})
+                    except Exception:
+                        pass
 
         task_up = asyncio.create_task(uplink_pump())
         task_down = asyncio.create_task(downlink_pump())
@@ -1584,6 +1936,10 @@ async def xhttp_tunnel_asgi(scope, receive, send):
 
     client_ip = _xhttp_client_ip(scope)
     session = _xhttp_get_or_create(session_id, link_uuid, expected_bytes, client_ip)
+    if session is None:
+        # 503 tells a legitimate client to back off and retry with a new session.
+        await _xhttp_send_simple(send, 503, [_xhttp_padding_header()])
+        return
 
     if method == "GET":
         await _xhttp_downlink(scope, receive, send, session, session_id)
