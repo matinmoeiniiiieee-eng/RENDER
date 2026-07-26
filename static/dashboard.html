@@ -410,6 +410,17 @@ const I18N={
  fa:{console:"کنسول دروازه",monitor:"پایش",manage:"مدیریت",settings:"تنظیمات",overview:"نمای کلی",overview_sub:"وضعیت زندهٔ دروازهٔ شما",inbounds:"ورودی‌ها",inbounds_sub:"مدیریت تونل‌ها، سهمیه و دسترسی",cleanip:"آی‌پی تمیز",cleanip_sub:"آی‌پی/دامنه‌های جایگزین در اشتراک‌ها",domain:"دامنه",system:"سیستم",online:"دروازه آنلاین است",logout:"خروج",refresh:"تازه‌سازی",traffic:"ترافیک کل",active:"اتصال‌های فعال",uptime:"مدت فعالیت",traffic_12h:"ترافیک — ۱۲ ساعت اخیر",resources:"منابع",cpu:"پردازنده",memory:"حافظه",endpoint:"نقطهٔ اتصال",requests:"درخواست‌ها",errors:"خطاها",new_inbound:"ورودی جدید",th_label:"برچسب",th_usage:"مصرف",th_ips:"آی‌پی فعال",th_expiry:"انقضا",th_status:"وضعیت",th_actions:"عملیات",add:"افزودن",cleanip_none:"هنوز آی‌پی تمیزی اضافه نشده.",domain_override:"بازنویسی دامنه",domain_sub:"استفاده از دامنهٔ سفارشی در کانفیگ‌ها",custom_domain:"دامنهٔ سفارشی",domain_hint:"خالی بگذارید تا آدرس پیش‌فرض استفاده شود. برای دامنهٔ پشت کلودفلر مفید است.",save:"ذخیره",system_sub:"امنیت و داده",change_pw:"تغییر رمز عبور",cur_pw:"رمز فعلی",new_pw:"رمز جدید (حداقل ۸ کاراکتر)",update:"به‌روزرسانی",backup:"پشتیبان‌گیری و بازیابی",backup_hint:"فضای پلن رایگان موقتی است — برای حفظ ورودی‌ها مرتب خروجی بگیرید.",export:"خروجی",import:"ورودی",lm_sub:"یک نام و محدودیت‌های اختیاری تعیین کنید.",f_label:"برچسب",f_limit:"محدودیت ترافیک",f_unit:"واحد",f_maxip:"حداکثر آی‌پی",f_expiry:"انقضا (روز)",create:"ساخت ورودی",save_changes:"ذخیرهٔ تغییرات",edit_inbound:"ویرایش ورودی",d_sub:"QR را در v2rayNG / Nekobox اسکن کنید یا لینک را کپی کنید.",vless_link:"لینک VLESS",sub_url:"آدرس اشتراک",copy:"کپی",qr_sub:"QR اشتراک",add_clean:"افزودن آی‌پی تمیز",addr_sub:"هر خط یک آی‌پی یا دامنه.",add_all:"افزودن همه",pwwarn:"شما از رمز پیش‌فرض استفاده می‌کنید. همین حالا رمز قوی تنظیم کنید.",fixnow:"رفع کن",never:"هرگز",unlimited:"∞",on:"روشن",off:"خاموش",expired:"منقضی",copied:"در کلیپ‌بورد کپی شد",created:"ورودی ساخته شد",deleted:"ورودی حذف شد",updated:"به‌روزرسانی شد",saved:"ذخیره شد",pw_updated:"رمز عبور به‌روزرسانی شد",pw_short:"رمز جدید باید حداقل ۸ کاراکتر باشد",fill:"لطفاً فیلدهای لازم را پر کنید",del_confirm:"این ورودی حذف شود؟ کاربران متصل قطع می‌شوند.",exported:"پشتیبان خروجی گرفته شد",imported:"پشتیبان بازیابی شد — در حال بارگذاری…",fail:"مشکلی پیش آمد",reset_usage:"صفر کردن مصرف",edit:"ویرایش",details:"جزئیات",delete:"حذف"}
 };
 const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
+// Every panel call goes through here. Previously a 401 (expired session) was
+// swallowed by the per-call `catch`, so the dashboard just froze with stale
+// numbers and no hint that you had been logged out.
+let _redirecting=false;
+async function api(url,opts){
+  const r=await fetch(url,opts);
+  if(r.status===401&&!_redirecting){_redirecting=true;location.href='/login';throw new Error('unauthorized')}
+  return r;
+}
+// Surface the server's message instead of a generic failure toast.
+async function apiError(r){try{const d=await r.json();return d.detail||T('fail')}catch(e){return T('fail')}}
 let lang=localStorage.getItem('ren_lang')||'en',theme=localStorage.getItem('ren_theme')||'dark';
 let allLinks=[],statsData={},chart,qr;
 const T=k=>(I18N[lang][k]||I18N.en[k]||k);
@@ -456,7 +467,7 @@ function renderStats(){const s=statsData;
   $('#cpu-v').textContent=Math.round(s.cpu_percent||0)+'%';$('#mem-v').textContent=Math.round(s.memory_percent||0)+'%';
   ring('cpu-ring',s.cpu_percent);ring('mem-ring',s.memory_percent);
 }
-async function loadStats(){try{const r=await fetch('/stats');if(!r.ok)return;statsData=await r.json();renderStats();drawChart()}catch(e){}}
+async function loadStats(){try{const r=await api('/stats');if(!r.ok)return;statsData=await r.json();renderStats();drawChart()}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
 function drawChart(rebuild){const ctx=$('#chart');if(!ctx||typeof Chart==='undefined'||!statsData.hourly_traffic)return;
   const sorted=Object.entries(statsData.hourly_traffic).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
@@ -472,7 +483,7 @@ function drawChart(rebuild){const ctx=$('#chart');if(!ctx||typeof Chart==='undef
 }
 
 // ---- links ----
-async function loadLinks(){try{const r=await fetch('/api/links');const d=await r.json();allLinks=d.links||[];renderLinks()}catch(e){}}
+async function loadLinks(){try{const r=await api('/api/links');const d=await r.json();allLinks=d.links||[];renderLinks()}catch(e){}}
 function statusPill(l){if(l.expired)return `<span class="pill exp"><span class="d"></span>${T('expired')}</span>`;
   return l.active?`<span class="pill on"><span class="d"></span>${T('on')}</span>`:`<span class="pill off"><span class="d"></span>${T('off')}</span>`}
 function expiryText(l){if(!l.expiry)return `<span class="mini">${T('never')}</span>`;const d=new Date(l.expiry);return `<span class="mini">${d.toLocaleDateString(lang==='fa'?'fa-IR':'en-US')}</span>`}
@@ -506,13 +517,18 @@ async function saveLink(){const uid=$('#lm-uid').value,label=$('#lm-label').valu
   const body={label,limit_value:$('#lm-limit').value||0,limit_unit:$('#lm-unit').value,max_connections:$('#lm-maxconn').value||0};
   const ed=$('#lm-expiry').value;if(ed!=='')body.expiry_days=ed;
   try{
-    if(uid){await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast(T('updated'))}
-    else{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw 0;toast(T('created'))}
+    // Both branches must check r.ok: the PATCH result was previously ignored,
+    // so a rejected edit still reported "updated" and the modal closed.
+    const r=uid
+      ?await api('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      :await api('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){toast(await apiError(r),true);return}
+    toast(T(uid?'updated':'created'));
     hide('#link-modal');loadLinks();loadStats();
   }catch(e){toast(T('fail'),true)}
 }
-async function toggleActive(uid,active){const l=allLinks.find(x=>x.uuid===uid);try{const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active})});if(!r.ok)throw 0;if(l)l.active=active;renderLinks()}catch(e){toast(T('fail'),true);renderLinks()}}
-async function deleteLink(uid){if(!confirm(T('del_confirm')))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast(T('deleted'));loadLinks();loadStats()}catch(e){toast(T('fail'),true)}}
+async function toggleActive(uid,active){const l=allLinks.find(x=>x.uuid===uid);try{const r=await api('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active})});if(!r.ok)throw 0;if(l)l.active=active;renderLinks()}catch(e){toast(T('fail'),true);renderLinks()}}
+async function deleteLink(uid){if(!confirm(T('del_confirm')))return;try{await api('/api/links/'+uid,{method:'DELETE'});toast(T('deleted'));loadLinks();loadStats()}catch(e){toast(T('fail'),true)}}
 
 let _qrLoad;
 function ensureQR(){if(window.QRCode)return Promise.resolve();if(!_qrLoad)_qrLoad=new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';s.onload=res;s.onerror=rej;document.head.appendChild(s)});return _qrLoad}
@@ -528,34 +544,34 @@ function showDetail(uid){const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
 }
 
 // ---- clean ip ----
-async function loadAddresses(){try{const r=await fetch('/api/addresses');const d=await r.json();const list=d.addresses||[];
+async function loadAddresses(){try{const r=await api('/api/addresses');const d=await r.json();const list=d.addresses||[];
   $('#addr-list').innerHTML=list.length?list.map((a,i)=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--line)">
     <span class="mono">${esc(a)}</span><button class="btn btn-sm btn-danger icon-btn" aria-label="${T('delete')}" onclick="delAddress(${i})">×</button></div>`).join('')
     :`<div class="empty">${T('cleanip_none')}</div>`}catch(e){}}
 async function addAddresses(){const lines=$('#new-addr').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!lines.length){toast(T('fill'),true);return}
-  for(const a of lines)await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})});
+  for(const a of lines)await api('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})});
   $('#new-addr').value='';hide('#addr-modal');toast(T('saved'));loadAddresses()}
-async function delAddress(i){await fetch('/api/addresses/'+i,{method:'DELETE'});loadAddresses()}
+async function delAddress(i){await api('/api/addresses/'+i,{method:'DELETE'});loadAddresses()}
 
 // ---- domain ----
-async function saveDomain(){await fetch('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:$('#domain-input').value})});toast(T('saved'));loadStats();loadLinks()}
-async function loadDomain(){try{const r=await fetch('/api/domain');const d=await r.json();$('#domain-input').value=d.domain||''}catch(e){}}
+async function saveDomain(){await api('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:$('#domain-input').value})});toast(T('saved'));loadStats();loadLinks()}
+async function loadDomain(){try{const r=await api('/api/domain');const d=await r.json();$('#domain-input').value=d.domain||''}catch(e){}}
 
 // ---- system ----
 async function changePassword(){const c=$('#cur-pw'),n=$('#new-pw');if(!c.value||n.value.length<8){toast(T('pw_short'),true);return}
-  const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:c.value,new_password:n.value})});
+  const r=await api('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:c.value,new_password:n.value})});
   if(r.ok){toast(T('pw_updated'));c.value='';n.value='';$('#pwBanner').classList.remove('show')}
   else{let m=T('fail');try{const j=await r.json();if(j.detail)m=j.detail}catch(_){}toast(m,true)}}
-async function exportData(){try{const r=await fetch('/api/backup');const d=await r.json();const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
+async function exportData(){try{const r=await api('/api/backup');const d=await r.json();const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='ren_backup.json';a.click();toast(T('exported'))}catch(e){toast(T('fail'),true)}}
 function importData(e){const f=e.target.files[0];if(!f)return;const rd=new FileReader();
-  rd.onload=async ev=>{try{const data=JSON.parse(ev.target.result);const r=await fetch('/api/backup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  rd.onload=async ev=>{try{const data=JSON.parse(ev.target.result);const r=await api('/api/backup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
     if(r.ok){toast(T('imported'));setTimeout(()=>location.reload(),1000)}else throw 0}catch(err){toast(T('fail'),true)}};rd.readAsText(f)}
 
-async function checkAccount(){try{const r=await fetch('/api/me');const d=await r.json();
+async function checkAccount(){try{const r=await api('/api/me');const d=await r.json();
   if(d&&d.must_change_password){$('#pwBanner').classList.add('show');goPage('system')}else $('#pwBanner').classList.remove('show')}catch(e){}}
-async function logout(){await fetch('/api/logout',{method:'POST'});location.href='/login'}
+async function logout(){await api('/api/logout',{method:'POST'});location.href='/login'}
 async function refreshAll(){await Promise.all([loadStats(),loadLinks(),loadAddresses()])}
 
 checkAccount();loadStats();loadLinks();loadAddresses();loadDomain();
