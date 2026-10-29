@@ -477,15 +477,6 @@ def test_vless_response_header_constant():
     assert main.VLESS_RESPONSE_HEADER == b"\x00\x00"
 
 
-def test_unsupported_command_udp_and_mux():
-    assert main.unsupported_reason(main.VLESS_CMD_TCP, "example.com") is None
-    # UDP was silently handed to open_connection() as if it were TCP.
-    assert main.unsupported_reason(main.VLESS_CMD_UDP, "1.1.1.1")
-    # Mux dials the *.mux.cool pseudo-host; fail loudly, not with a DNS error.
-    assert main.unsupported_reason(main.VLESS_CMD_TCP, "v1.mux.cool")
-    assert main.unsupported_reason(9, "example.com")
-
-
 # ----------------------------- input validation -----------------------------
 def test_malformed_json_is_400_not_500(client):
     client.post("/api/login", json={"password": "admin"})
@@ -769,5 +760,410 @@ def test_xhttp_downlink_headers_are_not_buffered_by_middleware():
         finally:
             main.LINKS.pop(uid, None)
             main.xhttp_sessions.clear()
+
+    asyncio.run(scenario())
+
+
+# =====================================================================
+# Stability pass: UDP, IPv6/Happy-Eyeballs, DNS cache, idle timeout
+# =====================================================================
+def _udp_frame(payload):
+    return len(payload).to_bytes(2, "big") + payload
+
+
+def test_unsupported_command_udp_and_mux():
+    assert main.unsupported_reason(main.VLESS_CMD_TCP, "example.com") is None
+    # Plain VLESS UDP (DNS / QUIC) is bridged now; it can be switched off.
+    assert main.unsupported_reason(main.VLESS_CMD_UDP, "1.1.1.1") is None
+    prev = main.UDP_ENABLED
+    try:
+        main.UDP_ENABLED = False
+        assert main.unsupported_reason(main.VLESS_CMD_UDP, "1.1.1.1")
+    finally:
+        main.UDP_ENABLED = prev
+    # Mux / XUDP dial the *.mux.cool pseudo-host; fail loudly, not with a DNS error.
+    assert main.unsupported_reason(main.VLESS_CMD_TCP, "v1.mux.cool")
+    assert main.unsupported_reason(main.VLESS_CMD_UDP, "v1.mux.cool")
+    assert main.unsupported_reason(main.VLESS_CMD_MUX, "v1.mux.cool")
+    assert main.unsupported_reason(9, "example.com")
+
+
+def test_udp_split_frames_handles_partial_frames():
+    buf = bytearray(_udp_frame(b"abc") + _udp_frame(b"defg") + b"\x00\x05ab")
+    assert main._udp_split_frames(buf) == [b"abc", b"defg"]
+    assert bytes(buf) == b"\x00\x05ab"          # incomplete frame kept
+    buf.extend(b"cde")
+    assert main._udp_split_frames(buf) == [b"abcde"]
+    assert buf == bytearray()
+
+
+def test_ip_blocked_covers_mapped_and_cgnat():
+    assert main._ip_is_blocked("::ffff:10.0.0.1") is True
+    assert main._ip_is_blocked("::ffff:127.0.0.1") is True
+    assert main._ip_is_blocked("100.64.1.2") is True
+    assert main._ip_is_blocked("::1") is True
+    assert main._ip_is_blocked("fe80::1") is True
+    assert main._ip_is_blocked("8.8.8.8") is False
+    assert main._ip_is_blocked("149.154.167.51") is False      # Telegram DC
+    assert main._ip_is_blocked("2001:67c:4e8:f004::a") is False  # Telegram DC IPv6
+
+
+def test_order_addresses_prefers_ipv4_and_interleaves():
+    prev = main._ipv6_state["ok"]
+    try:
+        main._ipv6_state["ok"] = True
+        out = main._order_addresses(["2a00::1", "2a00::2", "1.1.1.1", "1.1.1.1", "8.8.8.8"])
+        assert out == ["1.1.1.1", "2a00::1", "8.8.8.8", "2a00::2"]
+        # Without IPv6 egress, AAAA results are never dialled.
+        main._ipv6_state["ok"] = False
+        assert main._order_addresses(["2a00::1", "1.1.1.1"]) == ["1.1.1.1"]
+    finally:
+        main._ipv6_state["ok"] = prev
+
+
+def test_resolve_destination_filters_and_uses_cache():
+    async def scenario():
+        far = main.time.monotonic() + 60
+        main._dns_cache["mixed.example"] = (far, ("10.0.0.7", "93.184.216.34"))
+        main._dns_cache["internal.example"] = (far, ("10.0.0.7", "192.168.0.2"))
+        main._dns_cache["v6only.example"] = (far, ("2a00:1450::1",))
+        prev = main._ipv6_state["ok"]
+        try:
+            main._ipv6_state["ok"] = False
+            # Private answers are dropped, public ones are kept and dialled.
+            assert await main.resolve_destination("mixed.example", 443) == ["93.184.216.34"]
+            with pytest.raises(main.DestinationBlocked):
+                await main.resolve_destination("internal.example", 443)
+            # IPv6-only name on an IPv4-only host fails fast with a clear reason.
+            try:
+                await main.resolve_destination("v6only.example", 443)
+                raise AssertionError("expected failure")
+            except OSError as exc:
+                assert "IPv6" in str(exc)
+            assert await main.destination_allowed("internal.example", 443) is False
+        finally:
+            main._ipv6_state["ok"] = prev
+            for k in ("mixed.example", "internal.example", "v6only.example"):
+                main._dns_cache.pop(k, None)
+
+    asyncio.run(scenario())
+
+
+def test_happy_eyeballs_skips_dead_address():
+    async def scenario():
+        async def handler(reader, writer):
+            writer.write(b"hi")
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            # 127.0.0.2 refuses (server bound to .1 only) -> next address wins.
+            reader, writer = await main.connect_upstream(["127.0.0.2", "127.0.0.1"], port)
+            assert await reader.read(10) == b"hi"
+            writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_idle_timeout_counts_both_directions():
+    """A long download with a silent uplink must NOT be cut by the idle timer
+    (it was a per-direction read timeout, which killed big one-way transfers)."""
+    u = uuid_lib.uuid4()
+    uid = str(u)
+    main.LINKS[uid] = main.normalize_link(uid, {"label": "idle"})
+
+    async def scenario():
+        async def slow_sender(reader, writer):
+            for i in range(10):
+                writer.write(b"c%d;" % i)
+                await writer.drain()
+                await asyncio.sleep(0.1)
+            writer.close()
+        server = await asyncio.start_server(slow_sender, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        prev = main.IDLE_TIMEOUT
+        main.IDLE_TIMEOUT = 0.35   # far shorter than the 1 s transfer
+        got = []
+        never = asyncio.Event()
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            async def recv_client():
+                await never.wait()     # the client uplink stays silent
+
+            async def send_client(data):
+                got.append(data)
+
+            await asyncio.wait_for(main.bridge_tcp(
+                reader, writer, b"", recv_client, send_client, None, uid,
+                up_is_master=True), timeout=5)
+        finally:
+            main.IDLE_TIMEOUT = prev
+            server.close()
+            await server.wait_closed()
+        return b"".join(got)
+
+    try:
+        data = asyncio.run(scenario())
+        assert data == main.VLESS_RESPONSE_HEADER + b"".join(b"c%d;" % i for i in range(10))
+    finally:
+        main.LINKS.pop(uid, None)
+
+
+def test_idle_timeout_still_reaps_dead_tunnels():
+    u = uuid_lib.uuid4()
+    uid = str(u)
+    main.LINKS[uid] = main.normalize_link(uid, {"label": "idle2"})
+
+    async def scenario():
+        async def silent(reader, writer):
+            await asyncio.sleep(3)
+            writer.close()
+        server = await asyncio.start_server(silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        prev = main.IDLE_TIMEOUT
+        main.IDLE_TIMEOUT = 0.2
+        never = asyncio.Event()
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            async def recv_client():
+                await never.wait()
+
+            async def send_client(data):
+                pass
+
+            t0 = main.time.monotonic()
+            await asyncio.wait_for(main.bridge_tcp(
+                reader, writer, b"", recv_client, send_client, None, uid,
+                up_is_master=True), timeout=3)
+            assert main.time.monotonic() - t0 < 1.0
+        finally:
+            main.IDLE_TIMEOUT = prev
+            server.close()
+            await server.wait_closed()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        main.LINKS.pop(uid, None)
+
+
+def test_xhttp_udp_roundtrip():
+    """VLESS UDP (command 2) over XHTTP: length-prefixed datagrams go out to a
+    real UDP socket and the reply comes back framed, after the VLESS header."""
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        class Echo(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def datagram_received(self, data, addr):
+                self.transport.sendto(b"echo:" + data, addr)
+
+        transport, _ = await loop.create_datagram_endpoint(Echo, local_addr=("127.0.0.1", 0))
+        port = transport.get_extra_info("sockname")[1]
+
+        u = uuid_lib.uuid4()
+        uid = str(u)
+        main.LINKS[uid] = main.normalize_link(uid, {"label": "udp"})
+        prev = main.CONFIG.allow_private_ranges
+        main.CONFIG.allow_private_ranges = True
+        try:
+            sid = "udp-session"
+            header = build_vless_header(u.bytes, addr_type=1, address=b"\x7f\x00\x00\x01",
+                                        port=port, payload=_udp_frame(b"q1") + _udp_frame(b"q2"),
+                                        command=2)
+            down = bytearray()
+            got_all = asyncio.Event()
+            disc = asyncio.Event()
+
+            async def get_receive():
+                await disc.wait()
+                return {"type": "http.disconnect"}
+
+            expected = (main.VLESS_RESPONSE_HEADER + _udp_frame(b"echo:q1")
+                        + _udp_frame(b"echo:q2"))
+
+            async def get_send(ev):
+                if ev["type"] == "http.response.body" and ev.get("body"):
+                    down.extend(ev["body"])
+                    if len(down) >= len(expected):
+                        got_all.set()
+
+            get_task = asyncio.create_task(main.xhttp_tunnel_asgi(
+                {"type": "http", "method": "GET", "path": f"/{uid}/{sid}",
+                 "headers": [], "client": ("1.2.3.4", 5)}, get_receive, get_send))
+            await asyncio.sleep(0.05)
+
+            sent = {"done": False}
+
+            async def post_receive():
+                if not sent["done"]:
+                    sent["done"] = True
+                    return {"type": "http.request", "body": header, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def post_send(ev):
+                pass
+
+            await main.xhttp_tunnel_asgi(
+                {"type": "http", "method": "POST", "path": f"/{uid}/{sid}/0",
+                 "headers": [], "client": ("1.2.3.4", 5)}, post_receive, post_send)
+
+            await asyncio.wait_for(got_all.wait(), timeout=5)
+            assert bytes(down) == expected
+            disc.set()
+            await asyncio.wait_for(get_task, timeout=5)
+            assert sid not in main.xhttp_sessions
+        finally:
+            main.CONFIG.allow_private_ranges = prev
+            main.LINKS.pop(uid, None)
+            transport.close()
+
+    asyncio.run(scenario())
+
+
+def test_xhttp_routes_with_full_mount_path():
+    """Newer Starlette keeps the full path inside a Mount; routing must cope."""
+    async def scenario():
+        u = uuid_lib.uuid4()
+        uid = str(u)
+        main.LINKS[uid] = main.normalize_link(uid, {"label": "mount"})
+        status = {}
+        try:
+            async def send(ev):
+                if ev["type"] == "http.response.start":
+                    status["code"] = ev["status"]
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            await main.xhttp_tunnel_asgi(
+                {"type": "http", "method": "POST",
+                 "path": f"/{main.XHTTP_PATH_PREFIX}/{uid}/full-path-sess/abc",
+                 "headers": [], "client": ("1.2.3.4", 5)}, receive, send)
+            assert status.get("code") == 400   # reached seq validation, not 404
+        finally:
+            main.LINKS.pop(uid, None)
+            main.xhttp_sessions.clear()
+
+    asyncio.run(scenario())
+
+
+def test_password_check_runs_off_the_event_loop():
+    auth = main.make_auth("offloop-pass")
+
+    async def scenario():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        t = asyncio.create_task(ticker())
+        assert await main.verify_password_async("offloop-pass", auth) is True
+        assert await main.verify_password_async("nope", auth) is False
+        t.cancel()
+        # The loop kept ticking while PBKDF2 ran in a worker thread.
+        assert ticks > 0
+
+    asyncio.run(scenario())
+
+
+class _FakeWebSocket:
+    """Just enough of Starlette's WebSocket for websocket_tunnel()."""
+    def __init__(self, frames, subprotocol=None):
+        self.headers = {"sec-websocket-protocol": subprotocol} if subprotocol else {}
+        self.client = None
+        self.frames = asyncio.Queue()
+        for f in frames:
+            self.frames.put_nowait({"type": "websocket.receive", "bytes": f})
+        self.sent = bytearray()
+        self.closed = asyncio.Event()
+
+    async def accept(self, subprotocol=None):
+        pass
+
+    async def receive(self):
+        return await self.frames.get()
+
+    async def send_bytes(self, data):
+        self.sent.extend(data)
+
+    async def close(self, code=1000, reason=""):
+        self.closed.set()
+
+    def disconnect(self):
+        self.frames.put_nowait({"type": "websocket.disconnect"})
+
+
+def test_ws_tunnel_tcp_with_early_data_and_udp():
+    async def scenario():
+        import base64 as _b64
+
+        async def echo(reader, writer):
+            data = await reader.read(4096)
+            writer.write(b"tcp:" + data)
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(echo, "127.0.0.1", 0)
+        tcp_port = server.sockets[0].getsockname()[1]
+
+        loop = asyncio.get_running_loop()
+
+        class Echo(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def datagram_received(self, data, addr):
+                self.transport.sendto(b"udp:" + data, addr)
+
+        udp_t, _ = await loop.create_datagram_endpoint(Echo, local_addr=("127.0.0.1", 0))
+        udp_port = udp_t.get_extra_info("sockname")[1]
+
+        u = uuid_lib.uuid4()
+        uid = str(u)
+        main.LINKS[uid] = main.normalize_link(uid, {"label": "ws"})
+        prev = main.CONFIG.allow_private_ranges
+        main.CONFIG.allow_private_ranges = True
+        try:
+            # TCP, VLESS header delivered as 0-RTT early data.
+            hdr = build_vless_header(u.bytes, address=b"\x7f\x00\x00\x01", port=tcp_port,
+                                     payload=b"hello")
+            token = _b64.urlsafe_b64encode(hdr).decode().rstrip("=")
+            ws = _FakeWebSocket([], subprotocol=token)
+            await asyncio.wait_for(main.websocket_tunnel(ws, uid), timeout=5)
+            assert bytes(ws.sent) == main.VLESS_RESPONSE_HEADER + b"tcp:hello"
+            assert ws.closed.is_set()
+
+            # UDP (command 2), header in the first binary frame.
+            hdr = build_vless_header(u.bytes, address=b"\x7f\x00\x00\x01", port=udp_port,
+                                     payload=_udp_frame(b"dns"), command=2)
+            ws = _FakeWebSocket([hdr])
+            task = asyncio.create_task(main.websocket_tunnel(ws, uid))
+            expected = main.VLESS_RESPONSE_HEADER + _udp_frame(b"udp:dns")
+            for _ in range(100):
+                if len(ws.sent) >= len(expected):
+                    break
+                await asyncio.sleep(0.02)
+            assert bytes(ws.sent) == expected
+            ws.disconnect()
+            await asyncio.wait_for(task, timeout=5)
+            # Connection bookkeeping is released afterwards.
+            assert main.count_connections_for_link(uid) == 0
+        finally:
+            main.CONFIG.allow_private_ranges = prev
+            main.LINKS.pop(uid, None)
+            udp_t.close()
+            server.close()
+            await server.wait_closed()
 
     asyncio.run(scenario())
