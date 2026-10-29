@@ -188,15 +188,9 @@ application = PublicHostMiddleware(main.app)
 
 
 def run() -> None:
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
-
-    config = Config()
-    config.bind = [f"0.0.0.0:{main.CONFIG.port}"]
-    config.workers = 1
-    # Long-lived tunnels (notably the streaming XHTTP downlink GET).
-    config.keep_alive_timeout = 3600
-    asyncio.run(serve(application, config))
+    # Same server settings as main.py (WS keep-alive pings, large backlog,
+    # long keep-alive for the XHTTP downlink, uvloop when installed).
+    main.run_server(application)
 
 
 if __name__ == "__main__":

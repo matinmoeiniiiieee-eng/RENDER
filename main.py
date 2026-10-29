@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import hashlib
@@ -12,6 +13,7 @@ import ipaddress
 import uuid as uuid_lib
 import logging
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -52,6 +54,20 @@ CONFIG = Settings()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("REN-Gateway")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
 # ==========================================
 # Static UI assets (extracted from the monolith)
 # ==========================================
@@ -87,7 +103,10 @@ CUSTOM_DOMAIN: str = ""
 
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
-IDLE_TIMEOUT = 300
+# A tunnel is torn down only when NEITHER direction moved a byte for this long.
+# It used to be a per-direction read timeout, so a long one-way transfer (a big
+# Telegram/YouTube download with a quiet uplink) was killed mid-stream.
+IDLE_TIMEOUT = _env_float("REN_IDLE_TIMEOUT", 300)
 
 # Auth state: {"salt": hex, "hash": hex, "must_change": bool}
 AUTH: dict = {}
@@ -105,11 +124,56 @@ PBKDF2_ITERATIONS = 200_000
 DEFAULT_FINGERPRINT = os.environ.get("REN_FINGERPRINT", "chrome").strip() or "chrome"
 # WebSocket early-data budget (bytes) advertised via the `ed` path param.
 EARLY_DATA_MAX = 2048
-# Upstream TCP socket buffer size; modest so we stay inside PaaS memory limits.
-SOCKET_BUFFER_BYTES = 262144
+# Explicit upstream SO_RCVBUF/SO_SNDBUF. 0 (default) = leave Linux TCP
+# autotuning on. Pinning the buffers (the old fixed 256 KiB) DISABLES autotuning
+# and caps every connection at buffer/RTT, i.e. ~1.3 MB/s to a 200 ms-away
+# destination such as a far Telegram media DC.
+SOCKET_BUFFER_BYTES = int(_env_float("REN_SOCKET_BUFFER", 0))
 # Downstream read buffer bounds (adaptive between these two).
 DOWNSTREAM_MIN_BUF = 16384
 DOWNSTREAM_MAX_BUF = 262144
+# StreamReader high-water mark for upstream sockets (default asyncio is 64 KiB).
+STREAM_LIMIT = 262144
+
+# ---- Upstream connect / DNS ---------------------------------------------------
+CONNECT_TIMEOUT = _env_float("REN_CONNECT_TIMEOUT", 10)
+DNS_TIMEOUT = 8.0
+DNS_CACHE_TTL = _env_float("REN_DNS_CACHE_TTL", 120)
+DNS_NEGATIVE_TTL = 5.0
+DNS_CACHE_MAX = 4096
+# Dedicated resolver pool. getaddrinfo() blocks a thread per lookup; the default
+# asyncio executor is min(32, cpus + 4) = 5 threads on a 1-vCPU container, so a
+# page that opens 30 connections (Google, YouTube) queued every connect behind
+# DNS and blew through the connect timeout.
+DNS_WORKERS = max(4, int(_env_float("REN_DNS_WORKERS", 32)))
+# Happy Eyeballs (RFC 8305): start the next address if the previous one has not
+# connected within this delay, instead of hanging on a black-holed route.
+HAPPY_EYEBALLS_DELAY = 0.25
+MAX_CONNECT_ADDRESSES = 8
+# IPv6 egress: "auto" probes for a global IPv6 route at first use; "on"/"off"
+# force it. Many PaaS containers resolve AAAA records but cannot route IPv6, and
+# asyncio then tried the IPv6 address first and stalled until timeout: that is
+# exactly why Google/YouTube (dual-stack everywhere) failed while IPv4-only
+# targets (e.g. speedtest servers) worked.
+IPV6_MODE = (os.environ.get("REN_IPV6", "auto").strip().lower() or "auto")
+PREFER_IPV6 = _env_bool("REN_PREFER_IPV6", False)
+
+# ---- UDP over VLESS -------------------------------------------------------------
+# Xray/sing-box clients send DNS (port 53) and QUIC/HTTP3 (UDP 443: YouTube,
+# Google, Instagram...) as plain VLESS UDP. It used to be rejected outright, so
+# remote DNS and QUIC simply broke.
+UDP_ENABLED = _env_bool("REN_UDP", True)
+UDP_IDLE_TIMEOUT = _env_float("REN_UDP_IDLE_TIMEOUT", 90)
+UDP_DNS_IDLE_TIMEOUT = 20.0
+UDP_QUEUE_MAX = 1024             # datagrams buffered toward the client
+UDP_BATCH_BYTES = 65536          # coalesce queued datagrams into one client write
+UDP_MAX_PENDING = 2 * 65536 + 4  # unparsed uplink bytes (a frame is <= 64 KiB)
+
+# ---- Server ---------------------------------------------------------------------
+# WebSocket ping interval (seconds, 0 = off). PaaS edges drop idle upgraded
+# connections after ~60 s; pings keep an idle Telegram/WS tunnel alive instead
+# of forcing a reconnect storm.
+WS_PING_INTERVAL = _env_float("REN_WS_PING_INTERVAL", 20)
 
 # ---- XHTTP ("SplitHTTP") transport tuning -----------------------------------
 # XHTTP replaces the old gRPC transport. Unlike gRPC (which needs HTTP/2
@@ -171,6 +235,12 @@ def verify_password(pw: str, auth: dict) -> bool:
         return False
     candidate = hash_password(pw, salt)
     return secrets.compare_digest(candidate, auth.get("hash", ""))
+
+async def verify_password_async(pw: str, auth: dict) -> bool:
+    """PBKDF2 (200k rounds) costs ~0.1-0.3 s of pure CPU. Running it inline on
+    the event loop froze EVERY tunnel for that long on each login attempt, so a
+    handful of bad logins (or a bot hammering /api/login) stalled all traffic."""
+    return await asyncio.to_thread(verify_password, pw, auth)
 
 def _env_password_fingerprint(pw: str) -> str:
     """Stable, non-reversible marker for 'which ADMIN_PASSWORD produced this auth'.
@@ -447,6 +517,7 @@ async def prune_state_task():
                     and mono - sess.created > XHTTP_SESSION_GRACE * 2):
                 sess.closed.set()
                 xhttp_sessions.pop(sid, None)
+        _dns_prune()
 
 def ensure_default_link():
     if not LINKS:
@@ -615,31 +686,310 @@ async def close_connections_for_link(uid: str):
         connection_sockets.pop(cid, None)
     ip_ref_count.pop(uid, None)
 
+def record_error(message: str):
+    stats["total_errors"] += 1
+    error_logs.append({"error": message, "time": datetime.now().isoformat()})
+
+def _register_connection(uid: str, client_ip: str, handle, network: str, dest: str) -> str:
+    conn_id = secrets.token_urlsafe(8)
+    connections[conn_id] = {"uuid": uid, "ip": client_ip, "network": network, "dest": dest,
+                            "connected_at": datetime.now().isoformat(), "bytes": 0}
+    connection_sockets[conn_id] = handle
+    ip_ref_count[uid][client_ip] += 1
+    stats["total_requests"] += 1
+    return conn_id
+
+def _unregister_connection(conn_id: str | None):
+    if not conn_id:
+        return
+    info = connections.pop(conn_id, None)
+    connection_sockets.pop(conn_id, None)
+    if info:
+        remove_ip_from_link(info.get("uuid"), info.get("ip"))
+
 # ==========================================
 # SSRF hardening: block internal / metadata destinations
 # ==========================================
+_CGNAT_V4 = ipaddress.ip_network("100.64.0.0/10")
+
 def _ip_is_blocked(ip_str: str) -> bool:
     try:
-        ip = ipaddress.ip_address(ip_str)
+        ip = ipaddress.ip_address(ip_str.split("%", 1)[0])
     except ValueError:
         return False
+    # ::ffff:10.0.0.1 must be judged as the IPv4 address it really is.
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 4 and ip in _CGNAT_V4:
+        return True   # carrier-grade NAT space: PaaS-internal networks live here
     return (ip.is_loopback or ip.is_link_local or ip.is_private
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
-async def destination_allowed(address: str, port: int) -> bool:
-    if CONFIG.allow_private_ranges:
-        return True
+
+class DestinationBlocked(ValueError):
+    pass
+
+# ==========================================
+# Upstream resolver (cached) + Happy Eyeballs connect
+# ==========================================
+_ipv6_state: dict = {"ok": None}
+_dns_cache: dict = {}      # host -> (expires_monotonic, tuple_of_ips)
+_dns_inflight: dict = {}   # host -> Task resolving it (dedupes concurrent lookups)
+_dns_pool: ThreadPoolExecutor | None = None
+
+
+def _probe_ipv6() -> bool:
+    """True if this host has a GLOBAL IPv6 source address with a default route.
+
+    A UDP connect() sends no packet; it only asks the kernel to pick a route.
+    Containers that have only link-local/ULA IPv6 (the common PaaS case) fail
+    this and stay IPv4-only, which avoids black-holed IPv6 connects entirely.
+    """
+    if not socket.has_ipv6:
+        return False
     try:
-        loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM)
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try:
+            s.connect(("2001:4860:4860::8888", 53))
+            src = s.getsockname()[0]
+        finally:
+            s.close()
+        return ipaddress.ip_address(src.split("%", 1)[0]).is_global
+    except (OSError, ValueError):
+        return False
+
+
+def ipv6_available() -> bool:
+    ok = _ipv6_state["ok"]
+    if ok is None:
+        if IPV6_MODE in ("1", "true", "yes", "on"):
+            ok = True
+        elif IPV6_MODE in ("0", "false", "no", "off"):
+            ok = False
+        else:
+            ok = _probe_ipv6()
+        _ipv6_state["ok"] = ok
+        logger.info("IPv6 egress %s (REN_IPV6=%s)", "enabled" if ok else "disabled", IPV6_MODE)
+    return ok
+
+
+def _dns_executor() -> ThreadPoolExecutor:
+    global _dns_pool
+    if _dns_pool is None:
+        _dns_pool = ThreadPoolExecutor(max_workers=DNS_WORKERS, thread_name_prefix="ren-dns")
+    return _dns_pool
+
+
+def _order_addresses(addrs) -> list:
+    """Dedupe and interleave address families, preferred family first (RFC 8305)."""
+    v4, v6, seen = [], [], set()
+    for a in addrs:
+        a = str(a).split("%", 1)[0]
+        if a in seen:
+            continue
+        seen.add(a)
+        (v6 if ":" in a else v4).append(a)
+    if not ipv6_available():
+        v6 = []
+    first, second = (v6, v4) if PREFER_IPV6 else (v4, v6)
+    out = []
+    for i in range(max(len(first), len(second))):
+        if i < len(first):
+            out.append(first[i])
+        if i < len(second):
+            out.append(second[i])
+    return out
+
+
+def _dns_store(key: str, ips: tuple):
+    if len(_dns_cache) >= DNS_CACHE_MAX:
+        _dns_prune()
+        if len(_dns_cache) >= DNS_CACHE_MAX:
+            _dns_cache.clear()
+    ttl = DNS_CACHE_TTL if ips else DNS_NEGATIVE_TTL
+    _dns_cache[key] = (time.monotonic() + ttl, ips)
+
+
+def _dns_prune():
+    now = time.monotonic()
+    for k in [k for k, v in list(_dns_cache.items()) if v[0] <= now]:
+        _dns_cache.pop(k, None)
+
+
+def _dns_forget(host: str):
+    _dns_cache.pop((host or "").strip().lower().rstrip("."), None)
+
+
+async def _resolve_uncached(key: str) -> tuple:
+    loop = asyncio.get_running_loop()
+    family = socket.AF_UNSPEC if ipv6_available() else socket.AF_INET
+    try:
+        infos = await loop.run_in_executor(
+            _dns_executor(), socket.getaddrinfo, key, None, family, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        _dns_store(key, ())
+        raise OSError(f"DNS lookup failed for {key}: {exc}") from None
+    ips = tuple(_order_addresses(info[4][0] for info in infos))
+    _dns_store(key, ips)
+    if not ips:
+        raise OSError(f"DNS lookup failed for {key}: no usable address")
+    return ips
+
+
+def _retrieve_exception(task: asyncio.Task):
+    if not task.cancelled():
+        task.exception()
+
+
+async def resolve_host(host: str) -> list:
+    """Resolve a destination to an ordered IP list (literal IPs pass straight
+    through, names are cached and concurrent lookups for one name are shared)."""
+    host = (host or "").strip().strip("[]")
+    if not host:
+        raise OSError("empty destination address")
+    try:
+        return [str(ipaddress.ip_address(host.split("%", 1)[0]))]
+    except ValueError:
+        pass
+    key = host.lower().rstrip(".")
+    hit = _dns_cache.get(key)
+    if hit is not None and hit[0] > time.monotonic():
+        if hit[1]:
+            return list(hit[1])
+        raise OSError(f"DNS lookup failed for {key} (cached)")
+    task = _dns_inflight.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_resolve_uncached(key))
+        _dns_inflight[key] = task
+        task.add_done_callback(lambda _t, k=key: _dns_inflight.pop(k, None))
+        task.add_done_callback(_retrieve_exception)
+    return list(await asyncio.wait_for(asyncio.shield(task), DNS_TIMEOUT))
+
+
+async def resolve_destination(address: str, port: int) -> list:
+    """Resolve + vet a destination. Returns the IPs that are safe to dial.
+
+    We dial exactly the addresses we vetted (no second lookup), which also closes
+    the DNS-rebinding gap the old check-then-open_connection() flow had.
+    """
+    ips = await resolve_host(address)
+    if not ipv6_available():
+        v4 = [ip for ip in ips if ":" not in ip]
+        if not v4:
+            raise OSError(f"{address} is IPv6-only and this host has no IPv6 egress")
+        ips = v4
+    if not CONFIG.allow_private_ranges:
+        ips = [ip for ip in ips if not _ip_is_blocked(ip)]
+        if not ips:
+            raise DestinationBlocked("destination not allowed")
+    return ips[:MAX_CONNECT_ADDRESSES]
+
+
+async def destination_allowed(address: str, port: int) -> bool:
+    try:
+        await resolve_destination(address, port)
+        return True
     except Exception:
         return False
-    if not infos:
-        return False
-    for info in infos:
-        if _ip_is_blocked(info[4][0]):
-            return False
-    return True
+
+
+async def _happy_eyeballs(ips: list, port: int):
+    """Race connects across `ips`, staggered by HAPPY_EYEBALLS_DELAY.
+
+    A fast failure starts the next address immediately; a slow (black-holed)
+    attempt no longer blocks the rest. First success wins, the others are
+    cancelled/closed.
+    """
+    queue = list(ips)
+    pending: set = set()
+    task_ip: dict = {}
+    errors: list = []
+    winner = None
+    try:
+        while queue or pending:
+            if queue:
+                ip = queue.pop(0)
+                t = asyncio.ensure_future(asyncio.open_connection(ip, port, limit=STREAM_LIMIT))
+                task_ip[t] = ip
+                pending.add(t)
+            timeout = HAPPY_EYEBALLS_DELAY if queue else None
+            done, pending = await asyncio.wait(pending, timeout=timeout,
+                                               return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                exc = t.exception()
+                if exc is None:
+                    if winner is None:
+                        winner = t.result()
+                    else:
+                        try:
+                            t.result()[1].close()
+                        except Exception:
+                            pass
+                    continue
+                errors.append(exc)
+                ip = task_ip.get(t, "")
+                if (":" in ip and isinstance(exc, OSError)
+                        and exc.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL)):
+                    if _ipv6_state["ok"]:
+                        logger.warning("IPv6 route unusable (%s); continuing IPv4-only", exc)
+                    _ipv6_state["ok"] = False
+            if winner is not None:
+                return winner
+        if errors:
+            raise errors[-1]
+        raise OSError("no address to connect to")
+    finally:
+        for t in pending:
+            t.cancel()
+
+
+def _apply_socket_opts(writer: asyncio.StreamWriter):
+    """Tune an upstream TCP socket: keepalive, no-Nagle, optional buffers."""
+    try:
+        sock = writer.get_extra_info("socket")
+        if not sock:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Detect dead upstreams in ~2 min instead of the kernel's ~2 h default.
+        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 20), ("TCP_KEEPCNT", 3)):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+                except OSError:
+                    pass
+        # Disable Nagle: tunnelled traffic is already framed, so coalescing
+        # adds latency (esp. for interactive TLS records) with no benefit.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if SOCKET_BUFFER_BYTES > 0:
+            for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, opt, SOCKET_BUFFER_BYTES)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+async def connect_upstream(ips: list, port: int, address: str = ""):
+    try:
+        reader, writer = await asyncio.wait_for(_happy_eyeballs(ips, port), CONNECT_TIMEOUT)
+    except asyncio.TimeoutError:
+        if address:
+            _dns_forget(address)
+        raise OSError(f"connect to {address or ips[0]}:{port} timed out") from None
+    except OSError as exc:
+        if address:
+            _dns_forget(address)
+        raise OSError(f"connect to {address or ips[0]}:{port} failed: {exc}") from None
+    _apply_socket_opts(writer)
+    return reader, writer
+
+
+async def open_upstream(address: str, port: int):
+    """Resolve, vet and connect to a TCP destination (shared by WS and XHTTP)."""
+    ips = await resolve_destination(address, port)
+    return await connect_upstream(ips, port, address)
 
 # ==========================================
 # App + Lifespan
@@ -661,13 +1011,14 @@ async def lifespan(app: FastAPI):
                        "Set a strong ADMIN_PASSWORD or change it in the panel immediately.")
 
     ensure_default_link()
+    ipv6_available()   # probe once at boot so the log shows the egress mode
     tasks = [
         asyncio.create_task(keep_alive()),
         asyncio.create_task(cleanup_traffic_task()),
         asyncio.create_task(periodic_save_task()),
         asyncio.create_task(prune_state_task()),
     ]
-    logger.info(f"REN started on port {CONFIG.port}")
+    logger.info(f"REN started on port {CONFIG.port} (UDP {'on' if UDP_ENABLED else 'off'})")
     try:
         yield
     finally:
@@ -687,6 +1038,10 @@ def _allowed_origins() -> list:
     railway = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     if railway:
         origins.add(f"https://{railway.replace('https://', '').replace('http://', '')}")
+    for var in ("PUBLIC_DOMAIN", "DEPLEXO_DOMAIN"):
+        value = _clean_host(os.environ.get(var) or "")
+        if value:
+            origins.add(f"https://{value}")
     origins.add(f"http://localhost:{CONFIG.port}")
     origins.add(f"http://127.0.0.1:{CONFIG.port}")
     return list(origins)
@@ -835,7 +1190,7 @@ async def api_login(request: Request):
         raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
     body = await read_json(request)
     password = str(body.get("password") or "")
-    if not verify_password(password, AUTH):
+    if not await verify_password_async(password, AUTH):
         record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Invalid password")
     reset_login_attempts(ip)
@@ -868,11 +1223,11 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await read_json(request)
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
-    if not verify_password(current, AUTH):
+    if not await verify_password_async(current, AUTH):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(new) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-    AUTH = make_auth(new)
+    AUTH = await asyncio.to_thread(make_auth, new)
     AUTH["must_change"] = False
     # Preserve the fingerprint of the CURRENT env password. Without it the next
     # restart would see "env differs from stored" and silently roll this change
@@ -1170,26 +1525,31 @@ def parse_vless_header(buffer: bytes, expected_uuid_bytes: bytes):
 # VLESS commands: 1 = TCP, 2 = UDP, 3 = MUX.
 VLESS_CMD_TCP = 1
 VLESS_CMD_UDP = 2
+VLESS_CMD_MUX = 3
 MUX_ADDRESS_SUFFIX = "mux.cool"
 
 def unsupported_reason(command: int, address: str) -> str | None:
     """Return a human-readable reason if this request cannot be served, else None.
 
-    Both tunnels only bridge TCP. Previously a UDP request (command 2) was fed to
-    asyncio.open_connection() anyway, so it half-worked in confusing ways, and a
-    mux-enabled client (which dials the pseudo-host *.mux.cool) failed with an
-    opaque DNS error. Naming the cause makes the panel's error log actionable.
+    TCP and plain VLESS UDP (DNS, QUIC) are bridged. Mux / XUDP (which dial the
+    pseudo-host *.mux.cool) are not, and say so plainly so the panel's error log
+    is actionable instead of showing an opaque DNS error.
     """
+    if address and address.lower().endswith(MUX_ADDRESS_SUFFIX):
+        return "multiplexing (mux/XUDP) is not supported; disable mux in the client"
     if command == VLESS_CMD_UDP:
-        return ("UDP over VLESS is not supported by this gateway; "
-                "set the app's DNS/routing to TCP")
+        if not UDP_ENABLED:
+            return ("UDP over VLESS is disabled on this gateway (REN_UDP=false); "
+                    "set the app's DNS/routing to TCP")
+        return None
+    if command == VLESS_CMD_MUX:
+        return "multiplexing (mux/XUDP) is not supported; disable mux in the client"
     if command != VLESS_CMD_TCP:
         return f"unsupported VLESS command: {command}"
-    if address and address.lower().endswith(MUX_ADDRESS_SUFFIX):
-        return "multiplexing (mux) is not supported; disable mux in the client"
     return None
 
-async def check_quota(uid: str, extra_bytes: int) -> bool:
+def _quota_ok(uid: str, extra_bytes: int) -> bool:
+    """Synchronous hot-path quota check (no coroutine allocation per chunk)."""
     link = LINKS.get(uid)
     if not link or not link.get("active") or is_expired(link):
         return False
@@ -1198,36 +1558,8 @@ async def check_quota(uid: str, extra_bytes: int) -> bool:
         return True
     return (link.get("used_bytes", 0) + extra_bytes) <= limit
 
-# --- Shared transport helpers (reused by both the WS and XHTTP tunnels) ------
-def _apply_socket_opts(writer: asyncio.StreamWriter):
-    """Tune an upstream TCP socket: keepalive, no-Nagle, modest buffers."""
-    try:
-        sock = writer.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # Disable Nagle: tunnelled traffic is already framed, so coalescing
-            # adds latency (esp. for interactive TLS records) with no benefit.
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # Modest, PaaS-friendly socket buffers for smoother bulk throughput.
-            for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, opt, SOCKET_BUFFER_BYTES)
-                except OSError:
-                    pass
-    except Exception:
-        pass
-
-async def open_upstream(address: str, port: int):
-    """Open the destination TCP connection and apply socket tuning.
-
-    Shared by the WebSocket and XHTTP engines so both transports get identical
-    connect behaviour, timeouts and socket options.
-    """
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), timeout=10.0
-    )
-    _apply_socket_opts(writer)
-    return reader, writer
+async def check_quota(uid: str, extra_bytes: int) -> bool:
+    return _quota_ok(uid, extra_bytes)
 
 _hour_bucket = {"until": 0.0, "key": ""}
 
@@ -1250,6 +1582,8 @@ def account_traffic(conn_id: str | None, uid: str, size: int, is_request: bool =
 
     Consolidates the global stats counters, per-connection byte tally, hourly
     traffic histogram and per-link usage that the WS and XHTTP pumps both need.
+    `is_request` is kept for compatibility; requests are now counted once per
+    tunnel in _register_connection() (it used to count every uplink CHUNK).
     """
     global _state_dirty
     stats["total_bytes"] += size
@@ -1266,65 +1600,268 @@ def account_traffic(conn_id: str | None, uid: str, size: int, is_request: bool =
         # Usage moved -> the periodic flusher has something worth writing.
         _state_dirty = True
 
-async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
+# ==========================================
+# Transport-agnostic bridges (TCP + UDP), shared by WS and XHTTP
+# ==========================================
+class _Activity:
+    """Last time ANY byte moved in either direction (drives the idle timeout)."""
+    __slots__ = ("last",)
+
+    def __init__(self):
+        self.last = time.monotonic()
+
+    def touch(self):
+        self.last = time.monotonic()
+
+
+async def _idle_watchdog(activity: _Activity, timeout: float):
+    while True:
+        remaining = activity.last + timeout - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(remaining + 0.05)
+
+
+async def _supervise(up_coro, down_coro, activity: _Activity, idle_timeout: float,
+                     up_is_master: bool, stop: asyncio.Event | None):
+    """Run both pumps until the tunnel is over, then cancel and reap them.
+
+    The downlink, the idle watchdog and the optional external `stop` event always
+    end the tunnel. The uplink ends it only when `up_is_master` (WebSocket: the
+    uplink ending means the client is gone). On XHTTP the uplink is just a feeder
+    and the client may keep the GET open after it stops POSTing.
+    """
+    t_up = asyncio.ensure_future(up_coro)
+    t_down = asyncio.ensure_future(down_coro)
+    t_idle = asyncio.ensure_future(_idle_watchdog(activity, idle_timeout))
+    tasks = [t_up, t_down, t_idle]
+    waiters = {t_down, t_idle}
+    if up_is_master:
+        waiters.add(t_up)
+    if stop is not None:
+        t_stop = asyncio.ensure_future(stop.wait())
+        tasks.append(t_stop)
+        waiters.add(t_stop)
     try:
-        while True:
-            msg = await asyncio.wait_for(websocket.receive(), IDLE_TIMEOUT)
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data:
-                continue
-            size = len(data)
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded")
-                break
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-            account_traffic(conn_id, link_uid, size, is_request=True)
 
-            writer.write(data)
+async def bridge_tcp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                     initial_payload: bytes, recv_client, send_client,
+                     conn_id: str, uid: str, *, up_is_master: bool,
+                     stop: asyncio.Event | None = None):
+    """Pump a VLESS TCP tunnel. recv_client() -> bytes | None (EOF);
+    send_client(bytes) writes toward the client."""
+    activity = _Activity()
+    try:
+        if initial_payload:
+            writer.write(initial_payload)
             await writer.drain()
-    except (asyncio.TimeoutError, WebSocketDisconnect):
-        pass
-    except Exception:
-        pass
+
+        async def up():
+            try:
+                while True:
+                    data = await recv_client()
+                    if data is None:
+                        break
+                    if not data:
+                        continue
+                    size = len(data)
+                    if not _quota_ok(uid, size):
+                        break
+                    activity.touch()
+                    account_traffic(conn_id, uid, size)
+                    writer.write(data)
+                    await writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            finally:
+                try:
+                    if writer.can_write_eof():
+                        writer.write_eof()
+                except Exception:
+                    pass
+
+        async def down():
+            first = True
+            buf_size = DOWNSTREAM_MIN_BUF
+            try:
+                while True:
+                    data = await reader.read(buf_size)
+                    if not data:
+                        break
+                    size = len(data)
+                    # Grow the read size while we keep filling it (bulk transfer),
+                    # shrink when reads run small (interactive/idle).
+                    if size == buf_size and buf_size < DOWNSTREAM_MAX_BUF:
+                        buf_size = min(DOWNSTREAM_MAX_BUF, buf_size * 2)
+                    elif size < buf_size // 2 and buf_size > DOWNSTREAM_MIN_BUF:
+                        buf_size = max(DOWNSTREAM_MIN_BUF, buf_size // 2)
+                    if not _quota_ok(uid, size):
+                        break
+                    activity.touch()
+                    account_traffic(conn_id, uid, size)
+                    if first:
+                        data = VLESS_RESPONSE_HEADER + data
+                        first = False
+                    await send_client(data)
+            except asyncio.CancelledError:
+                first = False   # tearing down: don't write to a dead client
+                raise
+            except Exception:
+                pass
+            finally:
+                # An upstream that closes without sending anything still owes the
+                # client a well-formed (empty) VLESS response.
+                if first:
+                    try:
+                        await send_client(VLESS_RESPONSE_HEADER)
+                    except Exception:
+                        pass
+
+        await _supervise(up(), down(), activity, IDLE_TIMEOUT, up_is_master, stop)
     finally:
         try:
-            writer.write_eof()
+            writer.close()
         except Exception:
             pass
 
-async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
-    first = True
-    buf_size = DOWNSTREAM_MIN_BUF
+
+class _UdpUpstream(asyncio.DatagramProtocol):
+    def __init__(self, queue: asyncio.Queue):
+        self.queue = queue
+
+    def datagram_received(self, data, addr):
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            pass   # UDP semantics: drop rather than balloon memory
+
+    def error_received(self, exc):
+        pass       # ICMP unreachable etc.: QUIC/DNS retransmit on their own
+
+    def connection_lost(self, exc):
+        try:
+            self.queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+
+def _udp_split_frames(buf: bytearray) -> list:
+    """Pop every complete [u16 length][payload] VLESS UDP frame from `buf`."""
+    out = []
+    pos = 0
+    n = len(buf)
+    while n - pos >= 2:
+        length = (buf[pos] << 8) | buf[pos + 1]
+        if n - pos - 2 < length:
+            break
+        if length:
+            out.append(bytes(buf[pos + 2:pos + 2 + length]))
+        pos += 2 + length
+    if pos:
+        del buf[:pos]
+    return out
+
+
+def _udp_frame(payload: bytes) -> bytes:
+    return len(payload).to_bytes(2, "big") + payload
+
+
+async def bridge_udp(ips: list, port: int, initial_payload: bytes, recv_client, send_client,
+                     conn_id: str, uid: str, *, up_is_master: bool,
+                     stop: asyncio.Event | None = None):
+    """Plain VLESS UDP: each packet is framed as a big-endian u16 length + bytes,
+    in both directions; the VLESS response header leads the first downlink frame.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=UDP_QUEUE_MAX)
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: _UdpUpstream(queue), remote_addr=(ips[0], port))
+    activity = _Activity()
+    pending = bytearray()
+
+    def push(data: bytes):
+        pending.extend(data)
+        for pkt in _udp_split_frames(pending):
+            transport.sendto(pkt)
+        if len(pending) > UDP_MAX_PENDING:
+            raise ValueError("malformed VLESS UDP framing")
+
     try:
-        while True:
-            data = await asyncio.wait_for(reader.read(buf_size), IDLE_TIMEOUT)
-            if not data:
-                break
-            size = len(data)
+        if initial_payload:
+            push(initial_payload)
 
-            # Dynamically adjust buffer based on throughput saturation: grow when we
-            # keep filling the buffer (bulk transfer), shrink when reads run small
-            # (interactive/idle) so we don't pin large buffers per idle connection.
-            if size == buf_size and buf_size < DOWNSTREAM_MAX_BUF:
-                buf_size = min(DOWNSTREAM_MAX_BUF, buf_size * 2)
-            elif size < buf_size / 2 and buf_size > DOWNSTREAM_MIN_BUF:
-                buf_size = max(DOWNSTREAM_MIN_BUF, buf_size // 2)
+        async def up():
+            while True:
+                data = await recv_client()
+                if data is None:
+                    break
+                if not data:
+                    continue
+                size = len(data)
+                if not _quota_ok(uid, size):
+                    break
+                activity.touch()
+                account_traffic(conn_id, uid, size)
+                push(data)
 
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded")
-                break
+        async def down():
+            first = True
+            eof = False
+            while not eof:
+                pkt = await queue.get()
+                if pkt is None:
+                    break
+                out = bytearray(VLESS_RESPONSE_HEADER) if first else bytearray()
+                first = False
+                payload_bytes = 0
+                while True:
+                    out += _udp_frame(pkt)
+                    payload_bytes += len(pkt)
+                    if len(out) >= UDP_BATCH_BYTES:
+                        break
+                    try:
+                        pkt = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if pkt is None:
+                        eof = True
+                        break
+                if not _quota_ok(uid, payload_bytes):
+                    break
+                activity.touch()
+                account_traffic(conn_id, uid, payload_bytes)
+                await send_client(bytes(out))
 
-            account_traffic(conn_id, link_uid, size)
+        idle = UDP_DNS_IDLE_TIMEOUT if port == 53 else UDP_IDLE_TIMEOUT
+        await _supervise(up(), down(), activity, idle, up_is_master, stop)
+    finally:
+        transport.close()
 
-            await websocket.send_bytes((VLESS_RESPONSE_HEADER + data) if first else data)
-            first = False
-    except (asyncio.TimeoutError, WebSocketDisconnect):
-        pass
-    except Exception:
-        pass
 
+async def run_vless_tunnel(command: int, address: str, port: int, ips: list,
+                           initial_payload: bytes, recv_client, send_client,
+                           conn_id: str, uid: str, *, up_is_master: bool,
+                           stop: asyncio.Event | None = None):
+    if command == VLESS_CMD_UDP:
+        await bridge_udp(ips, port, initial_payload, recv_client, send_client, conn_id, uid,
+                         up_is_master=up_is_master, stop=stop)
+        return
+    reader, writer = await connect_upstream(ips, port, address)
+    await bridge_tcp(reader, writer, initial_payload, recv_client, send_client, conn_id, uid,
+                     up_is_master=up_is_master, stop=stop)
+
+# ==========================================
+# WebSocket Transport
+# ==========================================
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     # WebSocket 0-RTT: pull any early data out of the subprotocol header and echo
@@ -1335,9 +1872,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         await websocket.accept(subprotocol=subproto.split(",")[0].strip())
     else:
         await websocket.accept()
-    writer = None
     conn_id = None
     client_ip = get_client_ip(websocket)
+    address = ""
     try:
         link_data = LINKS.get(uuid)
         if not link_data or not link_data["active"] or is_expired(link_data):
@@ -1358,7 +1895,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
 
         # Seed with 0-RTT early data (may already hold the full VLESS header).
         buffer = early_data
-        command = port = address = initial_payload = None
+        command = port = initial_payload = None
         while True:
             if buffer:
                 parsed = parse_vless_header(buffer, expected_bytes)
@@ -1379,60 +1916,48 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                 continue
             buffer += chunk
 
-        # Only TCP is bridged; say so plainly instead of half-proxying.
         reason = unsupported_reason(command, address)
         if reason:
-            error_logs.append({"error": f"ws: {reason}", "time": datetime.now().isoformat()})
+            record_error(f"ws: {reason}")
             await websocket.close(code=1008, reason="unsupported request")
             return
 
-        # SSRF hardening: refuse internal / metadata destinations.
-        if not await destination_allowed(address, port):
+        # Resolve + SSRF-vet once; we then dial exactly these addresses.
+        try:
+            ips = await resolve_destination(address, port)
+        except DestinationBlocked:
             await websocket.close(code=1008, reason="destination not allowed")
             return
 
-        conn_id = secrets.token_urlsafe(8)
-        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
-        connection_sockets[conn_id] = websocket
-        ip_ref_count[uuid][client_ip] += 1
+        network = "udp" if command == VLESS_CMD_UDP else "tcp"
+        conn_id = _register_connection(uuid, client_ip, websocket, network, f"{address}:{port}")
+        # Header + first payload, counted exactly once (it used to be counted
+        # twice: once as `buffer`, again as `initial_payload`).
+        account_traffic(conn_id, uuid, len(buffer))
 
-        account_traffic(conn_id, uuid, len(buffer), is_request=True)
+        async def recv_client():
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                return None
+            return msg.get("bytes") or (msg.get("text") or "").encode()
 
-        # Reuse the shared upstream-connect helper (open_connection + socket
-        # tuning) so WS and XHTTP behave identically toward the destination.
-        reader, writer = await open_upstream(address, port)
+        async def send_client(data: bytes):
+            await websocket.send_bytes(data)
 
-        if initial_payload:
-            account_traffic(conn_id, uuid, len(initial_payload))
-            writer.write(initial_payload)
-            await writer.drain()
-
-        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
-        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-        # Await the cancelled halves so their teardown (write_eof, etc.) completes
-        # and no orphaned tasks linger between connections.
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await run_vless_tunnel(command, address, port, ips, initial_payload,
+                               recv_client, send_client, conn_id, uuid, up_is_master=True)
 
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
+        record_error(f"ws: {exc}")
     finally:
-        if writer:
-            try:
-                writer.close()
-            except Exception:
-                pass
-        if conn_id:
-            info = connections.pop(conn_id, None)
-            connection_sockets.pop(conn_id, None)
-            if info:
-                remove_ip_from_link(info.get("uuid"), info.get("ip"))
+        _unregister_connection(conn_id)
+        # Close promptly so the client app retries at once instead of waiting.
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 # ==========================================
 # XHTTP ("SplitHTTP") Transport Engine
@@ -1621,6 +2146,17 @@ async def _xhttp_reaper(session_id: str, session: "XhttpSession"):
                 xhttp_sessions.pop(session_id, None)
 
 
+async def _xhttp_backpressure(session: "XhttpSession"):
+    """Stall an uplink request while too many bytes wait to go upstream.
+
+    Waits on the queue draining instead of the old fixed 50 ms polling loop.
+    """
+    deadline = time.monotonic() + XHTTP_SESSION_GRACE
+    while (session.inflight_bytes > XHTTP_MAX_INFLIGHT_BYTES
+           and not session.closed.is_set() and time.monotonic() < deadline):
+        await asyncio.sleep(0.02)
+
+
 async def _xhttp_uplink_stream(receive, send, session: "XhttpSession"):
     """stream-up: a single long POST whose body IS the whole uplink stream."""
     try:
@@ -1637,12 +2173,7 @@ async def _xhttp_uplink_stream(receive, send, session: "XhttpSession"):
                     # Same backpressure the packet-up path applies: without it a
                     # fast client streaming into a slow destination grows the
                     # queue without bound.
-                    waited = 0.0
-                    while (session.inflight_bytes > XHTTP_MAX_INFLIGHT_BYTES
-                           and not session.closed.is_set()
-                           and waited < XHTTP_SESSION_GRACE):
-                        await asyncio.sleep(0.05)
-                        waited += 0.05
+                    await _xhttp_backpressure(session)
                 if not event.get("more_body", False):
                     break
             elif et == "http.disconnect":
@@ -1684,11 +2215,7 @@ async def _xhttp_uplink(scope, receive, send, session, session_id, seq_str):
 
     # Coarse backpressure: if the destination is slower than the client's uplink,
     # briefly stall the POST ack so buffered bytes can drain instead of piling up.
-    waited = 0.0
-    while (session.inflight_bytes > XHTTP_MAX_INFLIGHT_BYTES
-           and not session.closed.is_set() and waited < XHTTP_SESSION_GRACE):
-        await asyncio.sleep(0.05)
-        waited += 0.05
+    await _xhttp_backpressure(session)
 
     await _xhttp_send_simple(send, 200, [_xhttp_padding_header()])
 
@@ -1702,7 +2229,6 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
         return
     session.get_attached.set()
 
-    writer = None
     conn_id = None
     started = False
     disconnect_task = None
@@ -1739,13 +2265,11 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
         # Reassemble the VLESS header from the ordered uplink stream.
         buffer = b""
         command = address = port = initial_payload = None
-        header_ready = False
-        while not header_ready:
+        while True:
             if buffer:
                 parsed = parse_vless_header(buffer, session.expected_bytes)
                 if parsed is not None:
                     command, address, port, initial_payload = parsed
-                    header_ready = True
                     break
                 if len(buffer) > XHTTP_HEADER_MAX:
                     raise ValueError("Header overflow")
@@ -1763,9 +2287,8 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
         if reason:
             raise ValueError(reason)
 
-        # SSRF hardening: refuse internal / metadata destinations.
-        if not await destination_allowed(address, port):
-            raise ValueError("destination not allowed")
+        # Resolve + SSRF-vet once; we then dial exactly these addresses.
+        ips = await resolve_destination(address, port)
 
         uid = session.link_uuid
         link_data = LINKS.get(uid)
@@ -1775,119 +2298,44 @@ async def _xhttp_downlink(scope, receive, send, session, session_id):
             if not already_connected and count_connections_for_link(uid) >= max_conn:
                 raise ValueError("connection limit reached")
 
-        conn_id = secrets.token_urlsafe(8)
+        network = "udp" if command == VLESS_CMD_UDP else "tcp"
+        conn_id = _register_connection(uid, session.client_ip, session, network,
+                                       f"{address}:{port}")
         session.conn_id = conn_id
-        connections[conn_id] = {"uuid": uid, "ip": session.client_ip,
-                                "connected_at": datetime.now().isoformat(), "bytes": 0}
-        connection_sockets[conn_id] = session
-        ip_ref_count[uid][session.client_ip] += 1
+        account_traffic(conn_id, uid, len(buffer))
 
-        account_traffic(conn_id, uid, len(buffer), is_request=True)
+        async def recv_client():
+            chunk = await session.up_queue.get()
+            if chunk is None:
+                return None
+            session.consume(chunk)
+            return chunk
 
-        reader, writer = await open_upstream(address, port)
+        async def send_client(data: bytes):
+            await send({"type": "http.response.body", "body": data, "more_body": True})
 
-        if initial_payload:
-            account_traffic(conn_id, uid, len(initial_payload))
-            writer.write(initial_payload)
-            await writer.drain()
-
-        async def uplink_pump():
-            # Reassembled uplink bytes -> upstream socket.
-            try:
-                while True:
-                    chunk = await session.up_queue.get()
-                    if chunk is None:
-                        break
-                    session.consume(chunk)
-                    size = len(chunk)
-                    if not await check_quota(uid, size):
-                        break
-                    account_traffic(conn_id, uid, size, is_request=True)
-                    writer.write(chunk)
-                    await writer.drain()
-            except Exception:
-                pass
-            finally:
-                try:
-                    writer.write_eof()
-                except Exception:
-                    pass
-
-        async def downlink_pump():
-            # Upstream socket -> the GET response body (raw bytes, no framing).
-            # The VLESS response header MUST lead the stream. This was missing:
-            # the client then read the first two payload bytes as version/addon
-            # length and every XHTTP connection failed at the TLS handshake. WS
-            # already did this in tcp_to_ws(); both transports now agree.
-            first = True
-            buf_size = DOWNSTREAM_MIN_BUF
-            try:
-                while True:
-                    data = await asyncio.wait_for(reader.read(buf_size), IDLE_TIMEOUT)
-                    if not data:
-                        break
-                    size = len(data)
-                    if size == buf_size and buf_size < DOWNSTREAM_MAX_BUF:
-                        buf_size = min(DOWNSTREAM_MAX_BUF, buf_size * 2)
-                    elif size < buf_size / 2 and buf_size > DOWNSTREAM_MIN_BUF:
-                        buf_size = max(DOWNSTREAM_MIN_BUF, buf_size // 2)
-                    if not await check_quota(uid, size):
-                        break
-                    account_traffic(conn_id, uid, size)
-                    if first:
-                        data = VLESS_RESPONSE_HEADER + data
-                        first = False
-                    await send({"type": "http.response.body",
-                                "body": data, "more_body": True})
-            except Exception:
-                pass
-            finally:
-                # An upstream that closes without sending anything still owes the
-                # client a well-formed (empty) VLESS response.
-                if first:
-                    try:
-                        await send({"type": "http.response.body",
-                                    "body": VLESS_RESPONSE_HEADER, "more_body": True})
-                    except Exception:
-                        pass
-
-        task_up = asyncio.create_task(uplink_pump())
-        task_down = asyncio.create_task(downlink_pump())
-        watch = asyncio.create_task(session.closed.wait())
-        # Downlink is the master: finish when upstream EOFs (task_down), the
-        # client disconnects the GET, or the link is deleted (session.closed).
-        # The uplink is only a feeder — in packet-up the client may keep the GET
-        # open after it stops POSTing — so uplink completion must NOT tear down
-        # the still-active downlink.
-        await asyncio.wait({task_down, watch}, return_when=asyncio.FIRST_COMPLETED)
-        for t in (task_up, task_down, watch):
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(task_up, task_down, watch, return_exceptions=True)
+        # Downlink is the master: finish when upstream EOFs, the client
+        # disconnects the GET, or the link is deleted (session.closed). The uplink
+        # is only a feeder — in packet-up the client may keep the GET open after
+        # it stops POSTing — so uplink completion must NOT tear the tunnel down.
+        await run_vless_tunnel(command, address, port, ips, initial_payload,
+                               recv_client, send_client, conn_id, uid,
+                               up_is_master=False, stop=session.closed)
 
     except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": f"xhttp: {exc}", "time": datetime.now().isoformat()})
+        record_error(f"xhttp: {exc}")
     finally:
-        session.closed.set()
+        await session.close()
         if disconnect_task and not disconnect_task.done():
             disconnect_task.cancel()
-        if writer:
-            try:
-                writer.close()
-            except Exception:
-                pass
         if started:
             try:
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
             except Exception:
                 pass
-        if conn_id:
-            info = connections.pop(conn_id, None)
-            connection_sockets.pop(conn_id, None)
-            if info:
-                remove_ip_from_link(info.get("uuid"), info.get("ip"))
-        xhttp_sessions.pop(session_id, None)
+        _unregister_connection(conn_id)
+        if xhttp_sessions.get(session_id) is session:
+            xhttp_sessions.pop(session_id, None)
 
 
 async def xhttp_tunnel_asgi(scope, receive, send):
@@ -1912,7 +2360,13 @@ async def xhttp_tunnel_asgi(scope, receive, send):
         ])
         return
 
-    parts = [p for p in scope.get("path", "").split("/") if p]
+    path = scope.get("path", "")
+    # Newer Starlette versions keep the full path inside a Mount; strip the
+    # prefix ourselves so routing works on either behaviour.
+    mount_prefix = f"/{XHTTP_PATH_PREFIX}/"
+    if path.startswith(mount_prefix):
+        path = path[len(mount_prefix) - 1:]
+    parts = [p for p in path.split("/") if p]
     if len(parts) < 2:
         await _xhttp_send_simple(send, 404)
         return
@@ -1971,14 +2425,17 @@ async def dashboard_page(request: Request):
         return RedirectResponse(url="/login")
     return HTMLResponse(content=DASHBOARD_HTML)
 
-if __name__ == "__main__":
-    # Hypercorn serves the REST API, WebSocket transport and XHTTP transport on a
-    # single $PORT over HTTP/1.1. XHTTP rides ordinary HTTP requests (a streaming
-    # GET + short POSTs), so — unlike the old gRPC transport — no end-to-end
-    # HTTP/2 and no second/TCP-passthrough port are required. This is exactly why
-    # it survives PaaS/CDN edges (Railway, Render) that downgrade HTTP/2.
+# ==========================================
+# Server bootstrap (shared by main.py and deplexo_main.py)
+# ==========================================
+def build_server_config():
+    """Hypercorn config: REST API, WebSocket and XHTTP on one $PORT over HTTP/1.1.
+
+    XHTTP rides ordinary HTTP requests (a streaming GET + short POSTs), so —
+    unlike the old gRPC transport — no end-to-end HTTP/2 and no second/TCP-
+    passthrough port are required.
+    """
     from hypercorn.config import Config
-    from hypercorn.asyncio import serve
 
     config = Config()
     config.bind = [f"0.0.0.0:{CONFIG.port}"]
@@ -1986,4 +2443,34 @@ if __name__ == "__main__":
     # Long-lived tunnels: don't let idle-timeouts kill active proxy streams
     # (notably the long streaming XHTTP downlink GET).
     config.keep_alive_timeout = 3600
-    asyncio.run(serve(app, config))
+    # Bursty clients (a YouTube page, a Telegram media grid) open dozens of
+    # sockets at once; the default backlog of 100 dropped some of them.
+    config.backlog = 2048
+    config.graceful_timeout = 5
+    if WS_PING_INTERVAL > 0:
+        config.websocket_ping_interval = WS_PING_INTERVAL
+    return config
+
+
+def run_event_loop(coro):
+    """Run with uvloop when available (2-4x faster socket I/O than asyncio)."""
+    if _env_bool("REN_UVLOOP", True):
+        try:
+            import uvloop  # type: ignore
+        except ImportError:
+            uvloop = None
+        if uvloop is not None:
+            logger.info("Using uvloop event loop")
+            if hasattr(uvloop, "run"):
+                return uvloop.run(coro)
+            uvloop.install()
+    return asyncio.run(coro)
+
+
+def run_server(asgi_app=None):
+    from hypercorn.asyncio import serve
+    run_event_loop(serve(asgi_app or app, build_server_config()))
+
+
+if __name__ == "__main__":
+    run_server(app)

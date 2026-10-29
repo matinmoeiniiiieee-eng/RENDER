@@ -7,3 +7,6 @@ hypercorn==0.16.0
 httpx==0.25.1
 psutil==5.9.6
 pydantic-settings==2.1.0
+# libuv event loop: much faster socket I/O for the proxy hot path. Optional at
+# runtime (main.run_event_loop falls back to asyncio; REN_UVLOOP=false disables).
+uvloop==0.19.0; sys_platform != "win32"
